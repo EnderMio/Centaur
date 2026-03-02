@@ -202,6 +202,7 @@ cython_debug/
 .cursorindexingignore
 
 # Centaur runtime state
+.centaur/
 .centaur_state.json
 .centaur_prompts_backup/
 

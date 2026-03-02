@@ -99,6 +99,12 @@ centaur init
 
 ```
 
+也可以显式指定工作区目录（适合将运行状态与源码目录隔离）：
+
+```bash
+centaur init --workspace ./workspaces/my-project
+```
+
 默认是全局提示词模式：项目目录不复制 `AGENTS.md/SUPERVISOR.md/WORKER.md/VALIDATOR.md`，运行时严格读取已安装模板（会忽略项目同名文件）。
 如果你不想先执行 `init`，只要工作目录有 `PROPOSAL.md`，也可以直接 `centaur run`，由 Supervisor 首轮生成 `PLAN.md/PROJECT_STATUS.md/TASK.md`。
 
@@ -122,10 +128,16 @@ centaur run
 
 ```
 
+或显式指定工作区：
+
+```bash
+centaur run --workspace ./workspaces/my-project
+```
+
 说明：
 - 每次 Supervisor 下发任务后会进入 `人类验收门`。
-- 运行状态保存在 `.centaur_state.json`，重启后自动续跑。
-- 项目元数据保存在 `.centaur_project.json`（prompt 模式与版本）。
+- 运行状态保存在 `.centaur/state.json`，重启后自动续跑。
+- 项目元数据保存在 `.centaur/project.json`（prompt 模式与版本）。
 
 如需手动覆盖起点角色，可使用：
 ```bash

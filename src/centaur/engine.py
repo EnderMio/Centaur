@@ -19,8 +19,11 @@ PROMPT_MODE_FROZEN = "frozen"
 PROMPT_MODES = (PROMPT_MODE_GLOBAL, PROMPT_MODE_FROZEN)
 PROJECT_SCHEMA_VERSION = 1
 PROMPT_SET_VERSION = "2026-03-02"
-STATE_FILE = ".centaur_state.json"
-PROJECT_FILE = ".centaur_project.json"
+RUNTIME_DIR = ".centaur"
+STATE_FILE = "state.json"
+PROJECT_FILE = "project.json"
+LEGACY_STATE_FILE = ".centaur_state.json"
+LEGACY_PROJECT_FILE = ".centaur_project.json"
 ROLE_LABELS = {
     "supervisor": "Supervisor",
     "human_gate": "Human Gate",
@@ -118,8 +121,22 @@ def init_memory_files(workdir: Path) -> None:
         (workdir / name).touch(exist_ok=True)
 
 
+def _runtime_dir(workdir: Path) -> Path:
+    return workdir / RUNTIME_DIR
+
+
+def ensure_runtime_dir(workdir: Path) -> Path:
+    runtime_dir = _runtime_dir(workdir)
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    return runtime_dir
+
+
 def _project_path(workdir: Path) -> Path:
-    return workdir / PROJECT_FILE
+    return _runtime_dir(workdir) / PROJECT_FILE
+
+
+def _legacy_project_path(workdir: Path) -> Path:
+    return workdir / LEGACY_PROJECT_FILE
 
 
 def infer_prompt_mode_from_workspace(workdir: Path) -> str:
@@ -164,6 +181,7 @@ def _normalize_project_config(raw: dict[str, Any], fallback_mode: str) -> dict[s
 
 
 def save_project_config(workdir: Path, config: dict[str, Any]) -> None:
+    ensure_runtime_dir(workdir)
     path = _project_path(workdir)
     tmp_path = path.with_name(f"{path.name}.tmp")
     content = json.dumps(config, ensure_ascii=False, indent=2) + "\n"
@@ -172,16 +190,25 @@ def save_project_config(workdir: Path, config: dict[str, Any]) -> None:
 
 
 def load_project_config(workdir: Path) -> dict[str, Any] | None:
-    path = _project_path(workdir)
-    if not path.exists():
-        return None
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        print(f"⚠️ 项目配置读取失败，将自动重建：{path.name}")
-        return None
     fallback_mode = infer_prompt_mode_from_workspace(workdir)
-    return _normalize_project_config(raw, fallback_mode)
+    path = _project_path(workdir)
+    legacy_path = _legacy_project_path(workdir)
+
+    for candidate in (path, legacy_path):
+        if not candidate.exists():
+            continue
+        try:
+            raw = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            print(f"⚠️ 项目配置读取失败，将自动重建：{candidate.name}")
+            continue
+        config = _normalize_project_config(raw, fallback_mode)
+        if candidate == legacy_path:
+            save_project_config(workdir, config)
+            print(f"ℹ️ 已迁移旧项目配置到 {_project_path(workdir)}")
+        return config
+
+    return None
 
 
 def load_or_init_project_config(workdir: Path) -> dict[str, Any]:
@@ -191,7 +218,7 @@ def load_or_init_project_config(workdir: Path) -> dict[str, Any]:
     inferred_mode = infer_prompt_mode_from_workspace(workdir)
     config = default_project_config(prompt_mode=inferred_mode)
     save_project_config(workdir, config)
-    print(f"ℹ️ 已创建 {PROJECT_FILE} (prompt_mode={inferred_mode})")
+    print(f"ℹ️ 已创建 {_project_path(workdir)} (prompt_mode={inferred_mode})")
     return config
 
 
@@ -221,7 +248,11 @@ def _default_state() -> dict[str, Any]:
 
 
 def _state_path(workdir: Path) -> Path:
-    return workdir / STATE_FILE
+    return _runtime_dir(workdir) / STATE_FILE
+
+
+def _legacy_state_path(workdir: Path) -> Path:
+    return workdir / LEGACY_STATE_FILE
 
 
 def _normalize_state(raw: dict[str, Any]) -> dict[str, Any] | None:
@@ -233,6 +264,7 @@ def _normalize_state(raw: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def save_state(workdir: Path, state: dict[str, Any]) -> None:
+    ensure_runtime_dir(workdir)
     path = _state_path(workdir)
     tmp_path = path.with_name(f"{path.name}.tmp")
     content = json.dumps(state, ensure_ascii=False, indent=2) + "\n"
@@ -269,15 +301,24 @@ def infer_state_from_task(workdir: Path) -> dict[str, Any]:
 
 def load_state(workdir: Path) -> dict[str, Any]:
     path = _state_path(workdir)
-    if path.exists():
+    legacy_path = _legacy_state_path(workdir)
+
+    for candidate in (path, legacy_path):
+        if not candidate.exists():
+            continue
         try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
+            raw = json.loads(candidate.read_text(encoding="utf-8"))
             state = _normalize_state(raw)
-            if state is not None:
-                return state
-            print(f"⚠️ 状态文件格式异常，自动改为 TASK 推断：{path.name}")
         except (OSError, json.JSONDecodeError):
-            print(f"⚠️ 状态文件读取失败，自动改为 TASK 推断：{path.name}")
+            print(f"⚠️ 状态文件读取失败，自动改为 TASK 推断：{candidate.name}")
+            continue
+        if state is None:
+            print(f"⚠️ 状态文件格式异常，自动改为 TASK 推断：{candidate.name}")
+            continue
+        if candidate == legacy_path:
+            save_state(workdir, state)
+            print(f"ℹ️ 已迁移旧状态文件到 {_state_path(workdir)}")
+        return state
 
     inferred = infer_state_from_task(workdir)
     save_state(workdir, inferred)

@@ -14,8 +14,10 @@ from centaur.engine import (
     PROMPT_MODE_GLOBAL,
     PROMPT_MODES,
     PROMPT_SET_VERSION,
+    RUNTIME_DIR,
     ROLE_ORDER,
     ROLE_TEMPLATE_FILES,
+    STATE_FILE,
     default_project_config,
     infer_prompt_mode_from_workspace,
     init_state_file,
@@ -23,6 +25,15 @@ from centaur.engine import (
     run_workflow,
     save_project_config,
 )
+
+
+RUNTIME_STATE_PATH = f"{RUNTIME_DIR}/{STATE_FILE}"
+RUNTIME_PROJECT_PATH = f"{RUNTIME_DIR}/{PROJECT_FILE}"
+
+
+def _resolve_workspace(path_arg: str, workspace_arg: str | None) -> Path:
+    target = workspace_arg if workspace_arg else path_arg
+    return Path(target).resolve()
 
 
 def _write_templates(target_dir: Path, template_names: tuple[str, ...], force: bool) -> tuple[list[str], list[str]]:
@@ -54,7 +65,7 @@ def _archive_local_role_prompts(target_dir: Path) -> tuple[Path | None, list[str
 
 
 def cmd_init(args: argparse.Namespace) -> int:
-    target_dir = Path(args.path).resolve()
+    target_dir = _resolve_workspace(args.path, args.workspace)
     target_dir.mkdir(parents=True, exist_ok=True)
 
     written: list[str] = []
@@ -87,28 +98,28 @@ def cmd_init(args: argparse.Namespace) -> int:
         written.append("TASK.md")
 
     if init_state_file(target_dir, force=args.force):
-        written.append(".centaur_state.json")
+        written.append(RUNTIME_STATE_PATH)
     else:
-        skipped.append(".centaur_state.json")
+        skipped.append(RUNTIME_STATE_PATH)
 
     existing_config = load_project_config(target_dir)
     if existing_config is None:
         config = default_project_config(prompt_mode=prompt_mode)
         save_project_config(target_dir, config)
-        written.append(PROJECT_FILE)
+        written.append(RUNTIME_PROJECT_PATH)
     elif args.force:
         config = default_project_config(prompt_mode=prompt_mode)
         save_project_config(target_dir, config)
-        written.append(PROJECT_FILE)
+        written.append(RUNTIME_PROJECT_PATH)
     elif args.freeze_prompts and existing_config.get("prompt_mode") != PROMPT_MODE_FROZEN:
         existing_config["prompt_mode"] = PROMPT_MODE_FROZEN
         existing_config["centaur_version"] = __version__
         existing_config["prompt_set_version"] = PROMPT_SET_VERSION
         save_project_config(target_dir, existing_config)
-        written.append(PROJECT_FILE)
+        written.append(RUNTIME_PROJECT_PATH)
         notes.append("检测到 --freeze-prompts，已将项目 prompt_mode 同步为 frozen。")
     else:
-        skipped.append(PROJECT_FILE)
+        skipped.append(RUNTIME_PROJECT_PATH)
 
     print(f"✅ 已初始化: {target_dir}")
     effective_mode = load_project_config(target_dir)
@@ -124,12 +135,12 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    run_workflow(Path(args.path).resolve(), start_step=args.from_role)
+    run_workflow(_resolve_workspace(args.path, args.workspace), start_step=args.from_role)
     return 0
 
 
 def cmd_migrate(args: argparse.Namespace) -> int:
-    target_dir = Path(args.path).resolve()
+    target_dir = _resolve_workspace(args.path, args.workspace)
     if not target_dir.exists():
         print(f"❌ 目录不存在: {target_dir}")
         return 1
@@ -142,7 +153,7 @@ def cmd_migrate(args: argparse.Namespace) -> int:
     if config is None:
         inferred_mode = infer_prompt_mode_from_workspace(target_dir)
         config = default_project_config(prompt_mode=inferred_mode)
-        notes.append(f"未发现 {PROJECT_FILE}，已按旧项目形态推断为 `{inferred_mode}`。")
+        notes.append(f"未发现 {RUNTIME_PROJECT_PATH}，已按旧项目形态推断为 `{inferred_mode}`。")
 
     target_mode = args.prompts or config["prompt_mode"]
 
@@ -162,7 +173,7 @@ def cmd_migrate(args: argparse.Namespace) -> int:
     config["centaur_version"] = __version__
     config["prompt_set_version"] = PROMPT_SET_VERSION
     save_project_config(target_dir, config)
-    written.append(PROJECT_FILE)
+    written.append(RUNTIME_PROJECT_PATH)
 
     print(f"✅ 迁移完成: {target_dir}")
     print(f"Prompt 模式: {config['prompt_mode']}")
@@ -190,6 +201,11 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser = subparsers.add_parser("init", help="Initialize Centaur markdown templates in a directory.")
     init_parser.add_argument("path", nargs="?", default=".", help="Target directory (default: current directory).")
     init_parser.add_argument(
+        "-w",
+        "--workspace",
+        help="Workspace directory override (same purpose as positional `path`).",
+    )
+    init_parser.add_argument(
         "--freeze-prompts",
         action="store_true",
         help="Copy AGENTS/SUPERVISOR/WORKER/VALIDATOR prompts into the project directory.",
@@ -198,12 +214,17 @@ def build_parser() -> argparse.ArgumentParser:
         "-f",
         "--force",
         action="store_true",
-        help="Overwrite existing files created by init (including .centaur_project.json).",
+        help=f"Overwrite existing files created by init (including {RUNTIME_PROJECT_PATH}).",
     )
     init_parser.set_defaults(func=cmd_init)
 
     run_parser = subparsers.add_parser("run", help="Run the Supervisor -> Worker -> Validator workflow loop.")
     run_parser.add_argument("path", nargs="?", default=".", help="Workspace directory (default: current directory).")
+    run_parser.add_argument(
+        "-w",
+        "--workspace",
+        help="Workspace directory override (same purpose as positional `path`).",
+    )
     run_parser.add_argument(
         "--from-role",
         choices=ROLE_ORDER,
@@ -213,6 +234,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     migrate_parser = subparsers.add_parser("migrate", help="Migrate project metadata and prompt mode.")
     migrate_parser.add_argument("path", nargs="?", default=".", help="Workspace directory (default: current directory).")
+    migrate_parser.add_argument(
+        "-w",
+        "--workspace",
+        help="Workspace directory override (same purpose as positional `path`).",
+    )
     migrate_parser.add_argument(
         "--prompts",
         choices=PROMPT_MODES,
