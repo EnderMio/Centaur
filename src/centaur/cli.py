@@ -59,6 +59,7 @@ def cmd_init(args: argparse.Namespace) -> int:
 
     written: list[str] = []
     skipped: list[str] = []
+    notes: list[str] = []
     prompt_mode = PROMPT_MODE_FROZEN if args.freeze_prompts else PROMPT_MODE_GLOBAL
 
     project_written, project_skipped = _write_templates(target_dir, PROJECT_TEMPLATE_FILES, force=args.force)
@@ -91,19 +92,34 @@ def cmd_init(args: argparse.Namespace) -> int:
         skipped.append(".centaur_state.json")
 
     existing_config = load_project_config(target_dir)
-    if existing_config is None or args.force:
+    if existing_config is None:
         config = default_project_config(prompt_mode=prompt_mode)
         save_project_config(target_dir, config)
         written.append(PROJECT_FILE)
+    elif args.force:
+        config = default_project_config(prompt_mode=prompt_mode)
+        save_project_config(target_dir, config)
+        written.append(PROJECT_FILE)
+    elif args.freeze_prompts and existing_config.get("prompt_mode") != PROMPT_MODE_FROZEN:
+        existing_config["prompt_mode"] = PROMPT_MODE_FROZEN
+        existing_config["centaur_version"] = __version__
+        existing_config["prompt_set_version"] = PROMPT_SET_VERSION
+        save_project_config(target_dir, existing_config)
+        written.append(PROJECT_FILE)
+        notes.append("检测到 --freeze-prompts，已将项目 prompt_mode 同步为 frozen。")
     else:
         skipped.append(PROJECT_FILE)
 
     print(f"✅ 已初始化: {target_dir}")
-    print(f"Prompt 模式: {prompt_mode} ({'项目冻结提示词' if args.freeze_prompts else '全局提示词 + 项目可覆盖'})")
+    effective_mode = load_project_config(target_dir)
+    resolved_mode = effective_mode["prompt_mode"] if effective_mode is not None else prompt_mode
+    print(f"Prompt 模式: {resolved_mode} ({'项目冻结提示词' if resolved_mode == PROMPT_MODE_FROZEN else '全局提示词 + 项目可覆盖'})")
     if written:
         print("已创建/覆盖: " + ", ".join(written))
     if skipped:
         print("已存在(跳过): " + ", ".join(skipped))
+    for note in notes:
+        print("说明: " + note)
     return 0
 
 
