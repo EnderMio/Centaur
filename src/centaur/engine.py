@@ -1,10 +1,20 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
+from typing import Any
 
 CORE_FILES = ("SUPERVISOR.md", "WORKER.md", "VALIDATOR.md", "AGENTS.md")
 MEMORY_FILES = ("DESIGN.md", "LESSONS.md", "CODE_MAP.md", "PLAN.md", "PROJECT_STATUS.md")
+ROLE_ORDER = ("supervisor", "human_gate", "worker", "validator")
+STATE_FILE = ".centaur_state.json"
+ROLE_LABELS = {
+    "supervisor": "Supervisor",
+    "human_gate": "Human Gate",
+    "worker": "Worker",
+    "validator": "Validator",
+}
 
 
 def check_env(workdir: Path) -> None:
@@ -58,23 +68,131 @@ def init_memory_files(workdir: Path) -> None:
         (workdir / name).touch(exist_ok=True)
 
 
-def run_workflow(workdir: Path | None = None) -> None:
+def _default_state() -> dict[str, Any]:
+    return {"cycle": 1, "next_step": "supervisor"}
+
+
+def _state_path(workdir: Path) -> Path:
+    return workdir / STATE_FILE
+
+
+def _normalize_state(raw: dict[str, Any]) -> dict[str, Any] | None:
+    cycle = raw.get("cycle")
+    next_step = raw.get("next_step")
+    if isinstance(cycle, int) and cycle > 0 and next_step in ROLE_ORDER:
+        return {"cycle": cycle, "next_step": next_step}
+    return None
+
+
+def save_state(workdir: Path, state: dict[str, Any]) -> None:
+    path = _state_path(workdir)
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    content = json.dumps(state, ensure_ascii=False, indent=2) + "\n"
+    tmp_path.write_text(content, encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def infer_state_from_task(workdir: Path) -> dict[str, Any]:
+    task_path = workdir / "TASK.md"
+    if not task_path.exists():
+        return _default_state()
+
+    text = task_path.read_text(encoding="utf-8")
+    if not text.strip() or text.strip() == "# 当前任务 (Task)":
+        return _default_state()
+
+    worker_marker = "### Worker 执行报告"
+    validator_marker = "### Validator 审查报告"
+    worker_pos = text.rfind(worker_marker)
+    validator_pos = text.rfind(validator_marker)
+    completed_cycles = text.count(validator_marker)
+    cycle = max(1, completed_cycles + 1)
+
+    if worker_pos == -1 and validator_pos == -1:
+        if "## Worker 反馈区" in text or "@Worker" in text:
+            return {"cycle": cycle, "next_step": "human_gate"}
+        return _default_state()
+    if worker_pos > validator_pos:
+        return {"cycle": cycle, "next_step": "validator"}
+    if validator_pos > worker_pos:
+        return {"cycle": cycle, "next_step": "supervisor"}
+    return _default_state()
+
+
+def load_state(workdir: Path) -> dict[str, Any]:
+    path = _state_path(workdir)
+    if path.exists():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            state = _normalize_state(raw)
+            if state is not None:
+                return state
+            print(f"⚠️ 状态文件格式异常，自动改为 TASK 推断：{path.name}")
+        except (OSError, json.JSONDecodeError):
+            print(f"⚠️ 状态文件读取失败，自动改为 TASK 推断：{path.name}")
+
+    inferred = infer_state_from_task(workdir)
+    save_state(workdir, inferred)
+    return inferred
+
+
+def init_state_file(workdir: Path, force: bool = False) -> bool:
+    path = _state_path(workdir)
+    if path.exists() and not force:
+        return False
+    save_state(workdir, _default_state())
+    return True
+
+
+def _resolve_start_step(state: dict[str, Any], start_step: str | None) -> dict[str, Any]:
+    if start_step is None:
+        return state
+    if start_step not in ROLE_ORDER:
+        print(f"❌ 非法起始角色: {start_step}")
+        raise SystemExit(1)
+    state["next_step"] = start_step
+    return state
+
+
+def run_workflow(workdir: Path | None = None, start_step: str | None = None) -> None:
     base = (workdir or Path.cwd()).resolve()
 
     print("🤖 Codex Agent 2.0 (红蓝对抗版) 已启动！")
     check_env(base)
     init_memory_files(base)
+    state = load_state(base)
+    state = _resolve_start_step(state, start_step)
+    save_state(base, state)
+    print(f"♻️ 自动恢复状态：第 {state['cycle']} 轮，下一角色 {ROLE_LABELS[state['next_step']]}")
 
-    cycle = 1
     while True:
+        cycle = int(state["cycle"])
+        next_step = str(state["next_step"])
+
         print(f"\n{'█' * 60}")
-        print(f"🔄 第 {cycle} 轮开发周期开始")
+        print(f"🔄 第 {cycle} 轮开发周期 | 当前阶段: {ROLE_LABELS[next_step]}")
         print("█" * 60)
 
-        run_agent("Supervisor", base / "SUPERVISOR.md", base)
-        human_gate()
-        run_agent("Worker", base / "WORKER.md", base)
+        if next_step == "supervisor":
+            run_agent("Supervisor", base / "SUPERVISOR.md", base)
+            state["next_step"] = "human_gate"
+            save_state(base, state)
+            continue
+
+        if next_step == "human_gate":
+            human_gate()
+            state["next_step"] = "worker"
+            save_state(base, state)
+            continue
+
+        if next_step == "worker":
+            run_agent("Worker", base / "WORKER.md", base)
+            state["next_step"] = "validator"
+            save_state(base, state)
+            continue
 
         print("\n🔍 Validator 正在审查 Worker 的代码与数据契约...")
         run_agent("Validator", base / "VALIDATOR.md", base)
-        cycle += 1
+        state["cycle"] = cycle + 1
+        state["next_step"] = "supervisor"
+        save_state(base, state)

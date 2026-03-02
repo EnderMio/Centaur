@@ -5,7 +5,7 @@ from importlib.resources import files
 from pathlib import Path
 
 from centaur import __version__
-from centaur.engine import MEMORY_FILES, run_workflow
+from centaur.engine import MEMORY_FILES, ROLE_ORDER, init_state_file, run_workflow
 
 TEMPLATE_FILES = ("AGENTS.md", "SUPERVISOR.md", "WORKER.md", "VALIDATOR.md", "PROPOSAL.md")
 
@@ -42,6 +42,11 @@ def cmd_init(args: argparse.Namespace) -> int:
         task_file.write_text("# 当前任务 (Task)\n", encoding="utf-8")
         written.append("TASK.md")
 
+    if init_state_file(target_dir, force=args.force):
+        written.append(".centaur_state.json")
+    else:
+        skipped.append(".centaur_state.json")
+
     print(f"✅ 已初始化: {target_dir}")
     if written:
         print("已创建/覆盖: " + ", ".join(written))
@@ -51,7 +56,7 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    run_workflow(Path(args.path).resolve())
+    run_workflow(Path(args.path).resolve(), start_step=args.from_role)
     return 0
 
 
@@ -73,6 +78,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_parser = subparsers.add_parser("run", help="Run the Supervisor -> Worker -> Validator workflow loop.")
     run_parser.add_argument("path", nargs="?", default=".", help="Workspace directory (default: current directory).")
+    run_parser.add_argument(
+        "--from-role",
+        choices=ROLE_ORDER,
+        help="Override resume state and force the next role for this workflow.",
+    )
     run_parser.set_defaults(func=cmd_run)
 
     version_parser = subparsers.add_parser("version", help="Print Centaur CLI version.")

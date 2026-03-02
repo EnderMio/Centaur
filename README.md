@@ -76,6 +76,12 @@ centaur run
 ```
 
 *在每次 Supervisor 下发任务后，系统会暂停在 `🚦 [人类验收门]`，等待你的放行或微调。*
+*运行状态会写入当前目录的 `.centaur_state.json`，重启后会自动续跑到下一角色。*
+
+如需手动覆盖起点角色，可使用：
+```bash
+centaur run --from-role supervisor
+```
 
 ---
 
