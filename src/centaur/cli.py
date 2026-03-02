@@ -139,6 +139,8 @@ def cmd_migrate(args: argparse.Namespace) -> int:
         if moved:
             notes.append(f"已归档本地角色提示词到 {backup_dir}")
             notes.append("归档文件: " + ", ".join(moved))
+    else:
+        notes.append("已保留项目内角色提示词文件，但在 global 模式下运行时会忽略这些文件。")
 
     config["prompt_mode"] = target_mode
     config["centaur_version"] = __version__

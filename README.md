@@ -99,7 +99,7 @@ centaur init
 
 ```
 
-默认是全局提示词模式：项目目录不复制 `AGENTS.md/SUPERVISOR.md/WORKER.md/VALIDATOR.md`，运行时读取已安装模板。
+默认是全局提示词模式：项目目录不复制 `AGENTS.md/SUPERVISOR.md/WORKER.md/VALIDATOR.md`，运行时严格读取已安装模板（会忽略项目同名文件）。
 如果你不想先执行 `init`，只要工作目录有 `PROPOSAL.md`，也可以直接 `centaur run`，由 Supervisor 首轮生成 `PLAN.md/PROJECT_STATUS.md/TASK.md`。
 
 需冻结提示词到项目时：
@@ -107,6 +107,7 @@ centaur init
 ```bash
 centaur init --freeze-prompts
 ```
+冻结模式下运行时严格使用项目内角色提示词文件。
 
 ### 3. 定义北极星目标
 

@@ -45,10 +45,12 @@ def read_packaged_template(filename: str) -> str:
     return _template_dir().joinpath(filename).read_text(encoding="utf-8")
 
 
-def resolve_prompt_content(workdir: Path, filename: str) -> tuple[str, str]:
+def resolve_prompt_content(workdir: Path, filename: str, prompt_mode: str) -> tuple[str, str]:
     local_path = workdir / filename
-    if local_path.exists():
-        return local_path.read_text(encoding="utf-8"), "项目覆盖"
+    if prompt_mode == PROMPT_MODE_FROZEN:
+        if local_path.exists():
+            return local_path.read_text(encoding="utf-8"), "项目冻结"
+        raise FileNotFoundError(filename)
     if template_exists(filename):
         return read_packaged_template(filename), "全局模板"
     raise FileNotFoundError(filename)
@@ -61,18 +63,15 @@ def check_env(workdir: Path) -> None:
         print("👉 请先运行 `centaur init` 初始化模板。")
         raise SystemExit(1)
 
-    missing_prompt_files = [name for name in CORE_FILES if not (workdir / name).exists() and not template_exists(name)]
-    if missing_prompt_files:
-        print(f"❌ 启动失败：缺少角色提示词文件 {missing_prompt_files}")
-        print("👉 请执行 `centaur migrate --prompts frozen` 或重新安装 Centaur CLI。")
-        raise SystemExit(1)
 
-
-def run_agent(role: str, prompt_filename: str, workdir: Path) -> None:
+def run_agent(role: str, prompt_filename: str, workdir: Path, prompt_mode: str) -> None:
     try:
-        prompt_content, source = resolve_prompt_content(workdir, prompt_filename)
+        prompt_content, source = resolve_prompt_content(workdir, prompt_filename, prompt_mode)
     except FileNotFoundError as exc:
-        print(f"❌ 缺少提示词文件：{exc}. 请执行 `centaur migrate --prompts frozen` 修复。")
+        if prompt_mode == PROMPT_MODE_FROZEN:
+            print(f"❌ 缺少项目角色提示词文件：{exc}. 请执行 `centaur migrate --prompts frozen --force` 修复。")
+        else:
+            print(f"❌ 缺少全局角色提示词模板：{exc}. 请重新安装 Centaur CLI，或执行 `centaur migrate --prompts frozen`。")
         raise SystemExit(1)
     except OSError as exc:
         print(f"❌ 读取提示词失败: {exc}")
@@ -196,6 +195,27 @@ def load_or_init_project_config(workdir: Path) -> dict[str, Any]:
     return config
 
 
+def validate_prompt_mode_env(workdir: Path, prompt_mode: str) -> None:
+    if prompt_mode == PROMPT_MODE_FROZEN:
+        missing_local = [name for name in CORE_FILES if not (workdir / name).exists()]
+        if missing_local:
+            print(f"❌ 启动失败：frozen 模式缺少项目角色提示词文件 {missing_local}")
+            print("👉 请执行 `centaur migrate --prompts frozen --force` 修复。")
+            raise SystemExit(1)
+        return
+
+    missing_packaged = [name for name in CORE_FILES if not template_exists(name)]
+    if missing_packaged:
+        print(f"❌ 启动失败：global 模式缺少安装包模板 {missing_packaged}")
+        print("👉 请重新安装 Centaur CLI，或切换到 frozen: `centaur migrate --prompts frozen`")
+        raise SystemExit(1)
+
+    ignored_local = [name for name in CORE_FILES if (workdir / name).exists()]
+    if ignored_local:
+        print("ℹ️ 当前为 global 模式，已忽略项目内角色提示词文件: " + ", ".join(ignored_local))
+        print("ℹ️ 如需使用项目提示词，请执行 `centaur migrate --prompts frozen`。")
+
+
 def _default_state() -> dict[str, Any]:
     return {"cycle": 1, "next_step": "supervisor"}
 
@@ -297,11 +317,13 @@ def run_workflow(workdir: Path | None = None, start_step: str | None = None) -> 
     check_env(base)
     init_memory_files(base)
     project_config = load_or_init_project_config(base)
+    prompt_mode = str(project_config.get("prompt_mode", PROMPT_MODE_GLOBAL))
+    validate_prompt_mode_env(base, prompt_mode)
     state = load_state(base)
     state = _resolve_start_step(state, start_step)
     state = _ensure_supervisor_bootstrap(base, state)
     save_state(base, state)
-    print(f"🧭 Prompt 模式: {project_config['prompt_mode']}")
+    print(f"🧭 Prompt 模式: {prompt_mode}")
     print(f"♻️ 自动恢复状态：第 {state['cycle']} 轮，下一角色 {ROLE_LABELS[state['next_step']]}")
 
     while True:
@@ -313,7 +335,7 @@ def run_workflow(workdir: Path | None = None, start_step: str | None = None) -> 
         print("█" * 60)
 
         if next_step == "supervisor":
-            run_agent("Supervisor", "SUPERVISOR.md", base)
+            run_agent("Supervisor", "SUPERVISOR.md", base, prompt_mode)
             state["next_step"] = "human_gate"
             save_state(base, state)
             continue
@@ -325,13 +347,13 @@ def run_workflow(workdir: Path | None = None, start_step: str | None = None) -> 
             continue
 
         if next_step == "worker":
-            run_agent("Worker", "WORKER.md", base)
+            run_agent("Worker", "WORKER.md", base, prompt_mode)
             state["next_step"] = "validator"
             save_state(base, state)
             continue
 
         print("\n🔍 Validator 正在审查 Worker 的代码与数据契约...")
-        run_agent("Validator", "VALIDATOR.md", base)
+        run_agent("Validator", "VALIDATOR.md", base, prompt_mode)
         state["cycle"] = cycle + 1
         state["next_step"] = "supervisor"
         save_state(base, state)
