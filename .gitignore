@@ -205,6 +205,7 @@ cython_debug/
 .centaur/
 .centaur_state.json
 .centaur_prompts_backup/
+/workspaces/
 
 # Marimo
 marimo/_static/
