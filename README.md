@@ -121,6 +121,12 @@ centaur init --freeze-prompts
 
 ### 4. 启动引擎
 
+建议先体检工作区：
+
+```bash
+centaur doctor --workspace ./workspaces/my-project
+```
+
 运行调度脚本，开始人机协同开发：
 
 ```bash
@@ -132,6 +138,12 @@ centaur run
 
 ```bash
 centaur run --workspace ./workspaces/my-project
+```
+
+默认不建议在 Centaur 框架源码根目录直接运行；如确需如此，请显式放行：
+
+```bash
+centaur run --allow-repo-root
 ```
 
 说明：

@@ -10,4 +10,4 @@ from centaur.engine import run_workflow
 
 
 if __name__ == "__main__":
-    run_workflow(ROOT)
+    run_workflow(ROOT, allow_repo_root=True)

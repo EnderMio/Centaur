@@ -18,9 +18,12 @@ from centaur.engine import (
     ROLE_ORDER,
     ROLE_TEMPLATE_FILES,
     STATE_FILE,
+    codex_available,
+    collect_prompt_mode_issues,
     default_project_config,
     infer_prompt_mode_from_workspace,
     init_state_file,
+    is_framework_repo_root,
     load_project_config,
     run_workflow,
     save_project_config,
@@ -135,7 +138,64 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    run_workflow(_resolve_workspace(args.path, args.workspace), start_step=args.from_role)
+    run_workflow(
+        _resolve_workspace(args.path, args.workspace),
+        start_step=args.from_role,
+        allow_repo_root=args.allow_repo_root,
+    )
+    return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    target_dir = _resolve_workspace(args.path, args.workspace)
+    errors: list[str] = []
+    warnings: list[str] = []
+    infos: list[str] = []
+
+    if not target_dir.exists():
+        print(f"❌ 工作区不存在: {target_dir}")
+        return 1
+
+    if is_framework_repo_root(target_dir):
+        warnings.append("当前目录是框架源码根，建议使用 `--workspace` 指向独立工作区。")
+        if not args.allow_repo_root:
+            errors.append("默认策略不建议在源码根运行。可在 run 时显式加 `--allow-repo-root`。")
+
+    proposal_path = target_dir / "PROPOSAL.md"
+    if not proposal_path.exists():
+        errors.append("缺少 PROPOSAL.md（run 的最小前置条件）。")
+
+    config = load_project_config(target_dir)
+    if config is None:
+        inferred_mode = infer_prompt_mode_from_workspace(target_dir)
+        warnings.append(f"未发现 {RUNTIME_PROJECT_PATH}，将按旧项目形态推断 prompt_mode={inferred_mode}。")
+        prompt_mode = inferred_mode
+    else:
+        prompt_mode = str(config.get("prompt_mode", PROMPT_MODE_GLOBAL))
+        infos.append(f"prompt_mode={prompt_mode}")
+        infos.append(f"project_config={target_dir / RUNTIME_PROJECT_PATH}")
+
+    pm_errors, pm_warnings = collect_prompt_mode_issues(target_dir, prompt_mode)
+    errors.extend(pm_errors)
+    warnings.extend(pm_warnings)
+
+    if not codex_available():
+        errors.append("未找到 `codex` 命令（run 无法唤醒角色）。")
+    else:
+        infos.append("codex=available")
+
+    print(f"🩺 Doctor 工作区: {target_dir}")
+    for item in infos:
+        print(f"- INFO: {item}")
+    for item in warnings:
+        print(f"- WARN: {item}")
+    for item in errors:
+        print(f"- ERROR: {item}")
+
+    if errors:
+        print("结论: FAIL")
+        return 1
+    print("结论: PASS")
     return 0
 
 
@@ -230,7 +290,26 @@ def build_parser() -> argparse.ArgumentParser:
         choices=ROLE_ORDER,
         help="Override resume state and force the next role for this workflow.",
     )
+    run_parser.add_argument(
+        "--allow-repo-root",
+        action="store_true",
+        help="Allow running in Centaur source repository root (not recommended).",
+    )
     run_parser.set_defaults(func=cmd_run)
+
+    doctor_parser = subparsers.add_parser("doctor", help="Check workspace readiness and safety before run.")
+    doctor_parser.add_argument("path", nargs="?", default=".", help="Workspace directory (default: current directory).")
+    doctor_parser.add_argument(
+        "-w",
+        "--workspace",
+        help="Workspace directory override (same purpose as positional `path`).",
+    )
+    doctor_parser.add_argument(
+        "--allow-repo-root",
+        action="store_true",
+        help="Treat repository-root execution warning as non-fatal.",
+    )
+    doctor_parser.set_defaults(func=cmd_doctor)
 
     migrate_parser = subparsers.add_parser("migrate", help="Migrate project metadata and prompt mode.")
     migrate_parser.add_argument("path", nargs="?", default=".", help="Workspace directory (default: current directory).")

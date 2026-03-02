@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from importlib.resources import files
 import subprocess
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,19 @@ ROLE_LABELS = {
     "worker": "Worker",
     "validator": "Validator",
 }
+
+
+def is_framework_repo_root(workdir: Path) -> bool:
+    return (workdir / ".git").exists() and (workdir / "pyproject.toml").exists() and (workdir / "src" / "centaur").exists()
+
+
+def enforce_workspace_guard(workdir: Path, allow_repo_root: bool = False) -> None:
+    if allow_repo_root or not is_framework_repo_root(workdir):
+        return
+    print(f"❌ 检测到你正在框架源码根目录运行: {workdir}")
+    print("👉 请使用 `centaur run --workspace <path>` 在独立工作区运行。")
+    print("👉 如确需在源码根运行，请显式添加 `--allow-repo-root`。")
+    raise SystemExit(1)
 
 
 def _template_dir():
@@ -223,24 +237,42 @@ def load_or_init_project_config(workdir: Path) -> dict[str, Any]:
 
 
 def validate_prompt_mode_env(workdir: Path, prompt_mode: str) -> None:
+    errors, warnings = collect_prompt_mode_issues(workdir, prompt_mode)
+    for warning in warnings:
+        print(f"ℹ️ {warning}")
+    if errors:
+        print(f"❌ 启动失败：{errors[0]}")
+        if prompt_mode == PROMPT_MODE_FROZEN:
+            print("👉 请执行 `centaur migrate --prompts frozen --force` 修复。")
+        else:
+            print("👉 请重新安装 Centaur CLI，或切换到 frozen: `centaur migrate --prompts frozen`")
+        raise SystemExit(1)
+
+
+def collect_prompt_mode_issues(workdir: Path, prompt_mode: str) -> tuple[list[str], list[str]]:
+    errors: list[str] = []
+    warnings: list[str] = []
+
     if prompt_mode == PROMPT_MODE_FROZEN:
         missing_local = [name for name in CORE_FILES if not (workdir / name).exists()]
         if missing_local:
-            print(f"❌ 启动失败：frozen 模式缺少项目角色提示词文件 {missing_local}")
-            print("👉 请执行 `centaur migrate --prompts frozen --force` 修复。")
-            raise SystemExit(1)
-        return
+            errors.append(f"frozen 模式缺少项目角色提示词文件 {missing_local}")
+        return errors, warnings
 
     missing_packaged = [name for name in CORE_FILES if not template_exists(name)]
     if missing_packaged:
-        print(f"❌ 启动失败：global 模式缺少安装包模板 {missing_packaged}")
-        print("👉 请重新安装 Centaur CLI，或切换到 frozen: `centaur migrate --prompts frozen`")
-        raise SystemExit(1)
+        errors.append(f"global 模式缺少安装包模板 {missing_packaged}")
+        return errors, warnings
 
     ignored_local = [name for name in CORE_FILES if (workdir / name).exists()]
     if ignored_local:
-        print("ℹ️ 当前为 global 模式，已忽略项目内角色提示词文件: " + ", ".join(ignored_local))
-        print("ℹ️ 如需使用项目提示词，请执行 `centaur migrate --prompts frozen`。")
+        warnings.append("当前为 global 模式，已忽略项目内角色提示词文件: " + ", ".join(ignored_local))
+        warnings.append("如需使用项目提示词，请执行 `centaur migrate --prompts frozen`。")
+    return errors, warnings
+
+
+def codex_available() -> bool:
+    return shutil.which("codex") is not None
 
 
 def _default_state() -> dict[str, Any]:
@@ -351,10 +383,15 @@ def _ensure_supervisor_bootstrap(workdir: Path, state: dict[str, Any]) -> dict[s
     return {"cycle": 1, "next_step": "supervisor"}
 
 
-def run_workflow(workdir: Path | None = None, start_step: str | None = None) -> None:
+def run_workflow(
+    workdir: Path | None = None,
+    start_step: str | None = None,
+    allow_repo_root: bool = False,
+) -> None:
     base = (workdir or Path.cwd()).resolve()
 
     print("🤖 Codex Agent 2.0 (红蓝对抗版) 已启动！")
+    enforce_workspace_guard(base, allow_repo_root=allow_repo_root)
     check_env(base)
     init_memory_files(base)
     project_config = load_or_init_project_config(base)
