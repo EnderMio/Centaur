@@ -100,6 +100,7 @@ centaur init
 ```
 
 默认是全局提示词模式：项目目录不复制 `AGENTS.md/SUPERVISOR.md/WORKER.md/VALIDATOR.md`，运行时读取已安装模板。
+如果你不想先执行 `init`，只要工作目录有 `PROPOSAL.md`，也可以直接 `centaur run`，由 Supervisor 首轮生成 `PLAN.md/PROJECT_STATUS.md/TASK.md`。
 
 需冻结提示词到项目时：
 

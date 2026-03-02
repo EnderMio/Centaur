@@ -11,7 +11,7 @@ from centaur import __version__
 ROLE_TEMPLATE_FILES = ("AGENTS.md", "SUPERVISOR.md", "WORKER.md", "VALIDATOR.md")
 PROJECT_TEMPLATE_FILES = ("PROPOSAL.md",)
 CORE_FILES = ROLE_TEMPLATE_FILES
-REQUIRED_WORKSPACE_FILES = ("PROPOSAL.md", "TASK.md")
+REQUIRED_WORKSPACE_FILES = ("PROPOSAL.md",)
 MEMORY_FILES = ("DESIGN.md", "LESSONS.md", "CODE_MAP.md", "PLAN.md", "PROJECT_STATUS.md")
 ROLE_ORDER = ("supervisor", "human_gate", "worker", "validator")
 PROMPT_MODE_GLOBAL = "global"
@@ -282,6 +282,14 @@ def _resolve_start_step(state: dict[str, Any], start_step: str | None) -> dict[s
     return state
 
 
+def _ensure_supervisor_bootstrap(workdir: Path, state: dict[str, Any]) -> dict[str, Any]:
+    if (workdir / "TASK.md").exists():
+        return state
+    if state.get("next_step") != "supervisor" or state.get("cycle") != 1:
+        print("ℹ️ 检测到 TASK.md 缺失，已强制从 Supervisor 开始首轮建模。")
+    return {"cycle": 1, "next_step": "supervisor"}
+
+
 def run_workflow(workdir: Path | None = None, start_step: str | None = None) -> None:
     base = (workdir or Path.cwd()).resolve()
 
@@ -291,6 +299,7 @@ def run_workflow(workdir: Path | None = None, start_step: str | None = None) -> 
     project_config = load_or_init_project_config(base)
     state = load_state(base)
     state = _resolve_start_step(state, start_step)
+    state = _ensure_supervisor_bootstrap(base, state)
     save_state(base, state)
     print(f"🧭 Prompt 模式: {project_config['prompt_mode']}")
     print(f"♻️ 自动恢复状态：第 {state['cycle']} 轮，下一角色 {ROLE_LABELS[state['next_step']]}")
