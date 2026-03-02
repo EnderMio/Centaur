@@ -62,6 +62,14 @@ centaur init
 
 ```
 
+默认是全局提示词模式：项目目录不会复制 `AGENTS.md/SUPERVISOR.md/WORKER.md/VALIDATOR.md`，运行时直接使用已安装的 Centaur 模板。
+
+如需把当前提示词快照冻结到项目中（便于长期锁定行为）：
+
+```bash
+centaur init --freeze-prompts
+```
+
 ### 3. 定义北极星目标
 
 打开 `PROPOSAL.md`，清晰地写入你的项目需求和边界约束。
@@ -77,10 +85,17 @@ centaur run
 
 *在每次 Supervisor 下发任务后，系统会暂停在 `🚦 [人类验收门]`，等待你的放行或微调。*
 *运行状态会写入当前目录的 `.centaur_state.json`，重启后会自动续跑到下一角色。*
+*项目元数据会写入 `.centaur_project.json`（记录 prompt 模式与版本）。*
 
 如需手动覆盖起点角色，可使用：
 ```bash
 centaur run --from-role supervisor
+```
+
+如需升级后迁移项目（切换提示词模式 / 刷新版本记录）：
+```bash
+centaur migrate --prompts global
+centaur migrate --prompts frozen --force
 ```
 
 ---
