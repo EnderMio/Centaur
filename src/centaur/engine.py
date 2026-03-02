@@ -4,6 +4,7 @@ import json
 from importlib.resources import files
 import subprocess
 import shutil
+import re
 from pathlib import Path
 from typing import Any
 
@@ -18,13 +19,17 @@ ROLE_ORDER = ("supervisor", "human_gate", "worker", "validator")
 PROMPT_MODE_GLOBAL = "global"
 PROMPT_MODE_FROZEN = "frozen"
 PROMPT_MODES = (PROMPT_MODE_GLOBAL, PROMPT_MODE_FROZEN)
-PROJECT_SCHEMA_VERSION = 1
+PROJECT_SCHEMA_VERSION = 2
 PROMPT_SET_VERSION = "2026-03-02"
 RUNTIME_DIR = ".centaur"
 STATE_FILE = "state.json"
 PROJECT_FILE = "project.json"
 LEGACY_STATE_FILE = ".centaur_state.json"
 LEGACY_PROJECT_FILE = ".centaur_project.json"
+TASKS_DIR = "tasks"
+LOGS_DIR = "logs"
+DEFAULT_TASK_NAME = "default"
+TASK_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 ROLE_LABELS = {
     "supervisor": "Supervisor",
     "human_gate": "Human Gate",
@@ -145,6 +150,12 @@ def ensure_runtime_dir(workdir: Path) -> Path:
     return runtime_dir
 
 
+def ensure_runtime_layout(workdir: Path) -> None:
+    runtime_dir = ensure_runtime_dir(workdir)
+    (runtime_dir / TASKS_DIR).mkdir(parents=True, exist_ok=True)
+    (runtime_dir / LOGS_DIR).mkdir(parents=True, exist_ok=True)
+
+
 def _project_path(workdir: Path) -> Path:
     return _runtime_dir(workdir) / PROJECT_FILE
 
@@ -159,6 +170,26 @@ def infer_prompt_mode_from_workspace(workdir: Path) -> str:
     return PROMPT_MODE_GLOBAL
 
 
+def validate_task_name(task_name: str) -> bool:
+    return bool(TASK_NAME_RE.match(task_name))
+
+
+def _default_task_content() -> str:
+    return "# 当前任务 (Task)\n"
+
+
+def get_tasks_dir(workdir: Path) -> Path:
+    return _runtime_dir(workdir) / TASKS_DIR
+
+
+def get_logs_dir(workdir: Path) -> Path:
+    return _runtime_dir(workdir) / LOGS_DIR
+
+
+def task_file_path(workdir: Path, task_name: str) -> Path:
+    return get_tasks_dir(workdir) / f"{task_name}.md"
+
+
 def default_project_config(prompt_mode: str | None = None) -> dict[str, Any]:
     mode = prompt_mode if prompt_mode in PROMPT_MODES else PROMPT_MODE_GLOBAL
     return {
@@ -166,6 +197,11 @@ def default_project_config(prompt_mode: str | None = None) -> dict[str, Any]:
         "centaur_version": __version__,
         "prompt_set_version": PROMPT_SET_VERSION,
         "prompt_mode": mode,
+        "active_task": DEFAULT_TASK_NAME,
+        "controller_version": __version__,
+        "target_repo": "",
+        "target_ref": "main",
+        "target_version": "",
     }
 
 
@@ -186,16 +222,41 @@ def _normalize_project_config(raw: dict[str, Any], fallback_mode: str) -> dict[s
     if prompt_mode not in PROMPT_MODES:
         prompt_mode = fallback_mode
 
+    active_task = raw.get("active_task")
+    if not isinstance(active_task, str) or not validate_task_name(active_task):
+        active_task = DEFAULT_TASK_NAME
+
+    controller_version = raw.get("controller_version")
+    if not isinstance(controller_version, str) or not controller_version.strip():
+        controller_version = __version__
+
+    target_repo = raw.get("target_repo")
+    if not isinstance(target_repo, str):
+        target_repo = ""
+
+    target_ref = raw.get("target_ref")
+    if not isinstance(target_ref, str) or not target_ref.strip():
+        target_ref = "main"
+
+    target_version = raw.get("target_version")
+    if not isinstance(target_version, str):
+        target_version = ""
+
     return {
-        "schema_version": schema_version,
+        "schema_version": PROJECT_SCHEMA_VERSION,
         "centaur_version": centaur_version,
         "prompt_set_version": prompt_set_version,
         "prompt_mode": prompt_mode,
+        "active_task": active_task,
+        "controller_version": controller_version,
+        "target_repo": target_repo,
+        "target_ref": target_ref,
+        "target_version": target_version,
     }
 
 
 def save_project_config(workdir: Path, config: dict[str, Any]) -> None:
-    ensure_runtime_dir(workdir)
+    ensure_runtime_layout(workdir)
     path = _project_path(workdir)
     tmp_path = path.with_name(f"{path.name}.tmp")
     content = json.dumps(config, ensure_ascii=False, indent=2) + "\n"
@@ -226,6 +287,7 @@ def load_project_config(workdir: Path) -> dict[str, Any] | None:
 
 
 def load_or_init_project_config(workdir: Path) -> dict[str, Any]:
+    ensure_runtime_layout(workdir)
     config = load_project_config(workdir)
     if config is not None:
         return config
@@ -296,7 +358,7 @@ def _normalize_state(raw: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def save_state(workdir: Path, state: dict[str, Any]) -> None:
-    ensure_runtime_dir(workdir)
+    ensure_runtime_layout(workdir)
     path = _state_path(workdir)
     tmp_path = path.with_name(f"{path.name}.tmp")
     content = json.dumps(state, ensure_ascii=False, indent=2) + "\n"
@@ -365,6 +427,78 @@ def init_state_file(workdir: Path, force: bool = False) -> bool:
     return True
 
 
+def ensure_active_task_file(workdir: Path, project_config: dict[str, Any]) -> tuple[str, Path]:
+    ensure_runtime_layout(workdir)
+    active_task = str(project_config.get("active_task", DEFAULT_TASK_NAME))
+    if not validate_task_name(active_task):
+        active_task = DEFAULT_TASK_NAME
+        project_config["active_task"] = active_task
+        save_project_config(workdir, project_config)
+
+    target = task_file_path(workdir, active_task)
+    bus = workdir / "TASK.md"
+
+    if not target.exists() and bus.exists():
+        target.write_text(bus.read_text(encoding="utf-8"), encoding="utf-8")
+    elif target.exists() and not bus.exists():
+        bus.write_text(target.read_text(encoding="utf-8"), encoding="utf-8")
+    elif target.exists() and bus.exists():
+        try:
+            bus_mtime = bus.stat().st_mtime
+            task_mtime = target.stat().st_mtime
+            if bus_mtime > task_mtime + 1e-6:
+                target.write_text(bus.read_text(encoding="utf-8"), encoding="utf-8")
+            else:
+                bus.write_text(target.read_text(encoding="utf-8"), encoding="utf-8")
+        except OSError:
+            bus.write_text(target.read_text(encoding="utf-8"), encoding="utf-8")
+    else:
+        content = _default_task_content()
+        target.write_text(content, encoding="utf-8")
+        bus.write_text(content, encoding="utf-8")
+    return active_task, target
+
+
+def sync_task_bus_to_active(workdir: Path, active_task: str) -> None:
+    bus = workdir / "TASK.md"
+    target = task_file_path(workdir, active_task)
+    if not bus.exists():
+        return
+    ensure_runtime_layout(workdir)
+    target.write_text(bus.read_text(encoding="utf-8"), encoding="utf-8")
+
+
+def list_tasks(workdir: Path) -> list[str]:
+    tasks_dir = get_tasks_dir(workdir)
+    if not tasks_dir.exists():
+        return []
+    names: list[str] = []
+    for item in sorted(tasks_dir.glob("*.md")):
+        names.append(item.stem)
+    return names
+
+
+def migrate_schema(workdir: Path) -> dict[str, Any]:
+    ensure_runtime_layout(workdir)
+    config = load_or_init_project_config(workdir)
+    state = load_state(workdir)
+    save_state(workdir, state)
+    active_task, _ = ensure_active_task_file(workdir, config)
+    config["schema_version"] = PROJECT_SCHEMA_VERSION
+    config["centaur_version"] = __version__
+    config["active_task"] = active_task
+    if "controller_version" not in config or not str(config["controller_version"]).strip():
+        config["controller_version"] = __version__
+    if "target_repo" not in config or not isinstance(config["target_repo"], str):
+        config["target_repo"] = ""
+    if "target_ref" not in config or not str(config["target_ref"]).strip():
+        config["target_ref"] = "main"
+    if "target_version" not in config or not isinstance(config["target_version"], str):
+        config["target_version"] = ""
+    save_project_config(workdir, config)
+    return config
+
+
 def _resolve_start_step(state: dict[str, Any], start_step: str | None) -> dict[str, Any]:
     if start_step is None:
         return state
@@ -395,13 +529,16 @@ def run_workflow(
     check_env(base)
     init_memory_files(base)
     project_config = load_or_init_project_config(base)
+    active_task, _ = ensure_active_task_file(base, project_config)
     prompt_mode = str(project_config.get("prompt_mode", PROMPT_MODE_GLOBAL))
     validate_prompt_mode_env(base, prompt_mode)
     state = load_state(base)
     state = _resolve_start_step(state, start_step)
     state = _ensure_supervisor_bootstrap(base, state)
     save_state(base, state)
+    sync_task_bus_to_active(base, active_task)
     print(f"🧭 Prompt 模式: {prompt_mode}")
+    print(f"🧷 当前任务: {active_task}")
     print(f"♻️ 自动恢复状态：第 {state['cycle']} 轮，下一角色 {ROLE_LABELS[state['next_step']]}")
 
     while True:
@@ -416,18 +553,21 @@ def run_workflow(
             run_agent("Supervisor", "SUPERVISOR.md", base, prompt_mode)
             state["next_step"] = "human_gate"
             save_state(base, state)
+            sync_task_bus_to_active(base, active_task)
             continue
 
         if next_step == "human_gate":
             human_gate()
             state["next_step"] = "worker"
             save_state(base, state)
+            sync_task_bus_to_active(base, active_task)
             continue
 
         if next_step == "worker":
             run_agent("Worker", "WORKER.md", base, prompt_mode)
             state["next_step"] = "validator"
             save_state(base, state)
+            sync_task_bus_to_active(base, active_task)
             continue
 
         print("\n🔍 Validator 正在审查 Worker 的代码与数据契约...")
@@ -435,3 +575,4 @@ def run_workflow(
         state["cycle"] = cycle + 1
         state["next_step"] = "supervisor"
         save_state(base, state)
+        sync_task_bus_to_active(base, active_task)

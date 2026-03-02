@@ -149,7 +149,8 @@ centaur run --allow-repo-root
 说明：
 - 每次 Supervisor 下发任务后会进入 `人类验收门`。
 - 运行状态保存在 `.centaur/state.json`，重启后自动续跑。
-- 项目元数据保存在 `.centaur/project.json`（prompt 模式与版本）。
+- 项目元数据保存在 `.centaur/project.json`（包含 `prompt_mode`、`active_task`、`controller_version`、`target_repo/target_ref/target_version` 等）。
+- 任务总线快照保存在 `.centaur/tasks/`，证据日志目录为 `.centaur/logs/`。
 
 如需手动覆盖起点角色，可使用：
 ```bash
@@ -160,6 +161,19 @@ centaur run --from-role supervisor
 ```bash
 centaur migrate --prompts global
 centaur migrate --prompts frozen --force
+centaur migrate --schema
+```
+
+工作区与任务控制面：
+```bash
+# 工作区
+centaur workspace create selfhost --root ./workspaces
+centaur workspace list --root ./workspaces
+
+# 任务
+centaur task list --workspace ./workspaces/selfhost
+centaur task new feat_cli --workspace ./workspaces/selfhost --switch
+centaur task switch default --workspace ./workspaces/selfhost
 ```
 
 ---
