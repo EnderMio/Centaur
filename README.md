@@ -60,7 +60,7 @@ cp -r /path/to/centaur-template/* .
 
 ### 3. 启动引擎
 
-运行半自动化调度脚本，开始人机协同开发：
+运行调度脚本，开始人机协同开发：
 
 ```bash
 python run_workflow.py
