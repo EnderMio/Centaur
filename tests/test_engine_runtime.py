@@ -242,16 +242,19 @@ class EngineRuntimeTests(unittest.TestCase):
             self.assertIsNone(state["run_id"])
             self.assertIsNone(state["started_at"])
             self.assertEqual(state["attempt"], 0)
+            self.assertIsNone(state["last_checkpoint_sha"])
 
             persisted = json.loads(state_path.read_text(encoding="utf-8"))
             self.assertIn("inflight_role", persisted)
             self.assertIn("run_id", persisted)
             self.assertIn("started_at", persisted)
             self.assertIn("attempt", persisted)
+            self.assertIn("last_checkpoint_sha", persisted)
             self.assertIsNone(persisted["inflight_role"])
             self.assertIsNone(persisted["run_id"])
             self.assertIsNone(persisted["started_at"])
             self.assertEqual(persisted["attempt"], 0)
+            self.assertIsNone(persisted["last_checkpoint_sha"])
 
     def test_load_state_fail_fast_on_invalid_state_contract(self) -> None:
         invalid_cases = (
@@ -720,6 +723,121 @@ class EngineRuntimeTests(unittest.TestCase):
             self.assertEqual(payload["status"], "completed")
             self.assertTrue(payload["run_id"])
 
+    def test_run_workflow_validator_checkpoint_skips_non_git_workspace_without_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "PROPOSAL.md").write_text("proposal", encoding="utf-8")
+            (workspace / "TASK.md").write_text("# 当前任务 (Task)\n", encoding="utf-8")
+            load_or_init_project_config(workspace)
+            ensure_runtime_layout(workspace)
+            (workspace / RUNTIME_DIR / "state.json").write_text(
+                json.dumps({"cycle": 1, "next_step": "validator"}),
+                encoding="utf-8",
+            )
+
+            sync_counter = {"value": 0}
+            observed: dict[str, object] = {}
+
+            def _fake_run_agent(*_args, **_kwargs) -> None:
+                append_event(workspace, cycle=1, event_type="role_end", role="validator", return_code=0)
+
+            def _fake_sync_task_bus_to_active(_workdir: Path, _active_task: str) -> None:
+                sync_counter["value"] += 1
+                if sync_counter["value"] == 2:
+                    observed.update(json.loads((workspace / RUNTIME_DIR / "state.json").read_text(encoding="utf-8")))
+                    raise SystemExit(95)
+
+            output_buffer = io.StringIO()
+            with patch("centaur.engine.run_agent", side_effect=_fake_run_agent), patch(
+                "centaur.engine.sync_task_bus_to_active", side_effect=_fake_sync_task_bus_to_active
+            ), redirect_stdout(output_buffer):
+                with self.assertRaises(SystemExit) as cm:
+                    run_workflow(workdir=workspace, headless=True)
+            output = output_buffer.getvalue()
+
+            self.assertEqual(cm.exception.code, 95)
+            self.assertEqual(observed["cycle"], 2)
+            self.assertEqual(observed["next_step"], "supervisor")
+            self.assertIsNone(observed["last_checkpoint_sha"])
+            self.assertIn("不是 Git 仓库", output)
+
+    def test_run_workflow_validator_checkpoint_commits_changes_and_persists_sha(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "PROPOSAL.md").write_text("proposal", encoding="utf-8")
+            (workspace / "TASK.md").write_text("# 当前任务 (Task)\n", encoding="utf-8")
+            tracked_file = workspace / "feature.txt"
+            tracked_file.write_text("v1\n", encoding="utf-8")
+
+            subprocess.run(["git", "init"], cwd=workspace, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "Centaur Bot"], cwd=workspace, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "config", "user.email", "centaur@example.com"],
+                cwd=workspace,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(["git", "add", "PROPOSAL.md", "TASK.md", "feature.txt"], cwd=workspace, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=workspace, check=True, capture_output=True, text=True)
+
+            tracked_file.write_text("v1\nv2\n", encoding="utf-8")
+            load_or_init_project_config(workspace)
+            ensure_runtime_layout(workspace)
+            (workspace / RUNTIME_DIR / "state.json").write_text(
+                json.dumps({"cycle": 1, "next_step": "validator"}),
+                encoding="utf-8",
+            )
+
+            sync_counter = {"value": 0}
+            observed: dict[str, object] = {}
+
+            def _fake_run_agent(*_args, **_kwargs) -> None:
+                append_event(workspace, cycle=1, event_type="role_end", role="validator", return_code=0)
+
+            def _fake_sync_task_bus_to_active(_workdir: Path, _active_task: str) -> None:
+                sync_counter["value"] += 1
+                if sync_counter["value"] == 2:
+                    observed.update(json.loads((workspace / RUNTIME_DIR / "state.json").read_text(encoding="utf-8")))
+                    raise SystemExit(96)
+
+            with patch("centaur.engine.run_agent", side_effect=_fake_run_agent), patch(
+                "centaur.engine.sync_task_bus_to_active", side_effect=_fake_sync_task_bus_to_active
+            ):
+                with self.assertRaises(SystemExit) as cm:
+                    run_workflow(workdir=workspace, headless=True)
+
+            self.assertEqual(cm.exception.code, 96)
+            self.assertEqual(observed["cycle"], 2)
+            self.assertEqual(observed["next_step"], "supervisor")
+            checkpoint_sha = str(observed["last_checkpoint_sha"] or "")
+            self.assertTrue(checkpoint_sha)
+
+            head_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=workspace, check=True, capture_output=True, text=True
+            ).stdout.strip()
+            self.assertEqual(checkpoint_sha, head_sha)
+
+            commit_body = subprocess.run(
+                ["git", "log", "-1", "--pretty=%B"], cwd=workspace, check=True, capture_output=True, text=True
+            ).stdout
+            self.assertIn("cycle=1", commit_body)
+            self.assertIn("role=validator", commit_body)
+            self.assertIn("\"cycle\": 1", commit_body)
+            self.assertIn("\"run_id\":", commit_body)
+            self.assertIn("\"timestamp\":", commit_body)
+
+            changed_files = subprocess.run(
+                ["git", "show", "--name-only", "--pretty=format:", "HEAD"],
+                cwd=workspace,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            self.assertIn("feature.txt", changed_files)
+            self.assertNotIn(".centaur/state.json", changed_files)
+            self.assertNotIn(".centaur/events.jsonl", changed_files)
+
     def test_run_workflow_blocks_progress_when_task_run_id_evidence_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -868,8 +986,9 @@ class EngineRuntimeTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with self.assertRaises(SystemExit):
-                run_workflow(workdir=workspace, headless=True)
+            with patch("centaur.engine.try_create_validator_checkpoint", return_value=None):
+                with self.assertRaises(SystemExit):
+                    run_workflow(workdir=workspace, headless=True)
 
             events_path = workspace / RUNTIME_DIR / EVENTS_FILE
             self.assertTrue(events_path.exists())

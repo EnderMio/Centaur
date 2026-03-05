@@ -48,6 +48,7 @@ ROLE_LABELS = {
 }
 TRANSACTION_STATE_FIELDS = ("inflight_role", "run_id", "started_at", "attempt")
 TASK_COMPLETION_EVIDENCE_PREFIX = "[CENTAUR_ROLE_COMPLETION] "
+CHECKPOINT_ROLE = "validator"
 
 
 def is_framework_repo_root(workdir: Path) -> bool:
@@ -616,6 +617,7 @@ def _build_state(cycle: int, next_step: str) -> dict[str, Any]:
         "run_id": None,
         "started_at": None,
         "attempt": 0,
+        "last_checkpoint_sha": None,
     }
 
 
@@ -705,6 +707,21 @@ def _normalize_state(raw: Any) -> dict[str, Any]:
         else:
             attempt = attempt_raw
 
+    if "last_checkpoint_sha" not in raw:
+        last_checkpoint_sha = None
+    else:
+        checkpoint_raw = raw.get("last_checkpoint_sha")
+        if checkpoint_raw is None:
+            last_checkpoint_sha = None
+        elif isinstance(checkpoint_raw, str) and checkpoint_raw.strip():
+            last_checkpoint_sha = checkpoint_raw.strip()
+        else:
+            errors.append(
+                "`last_checkpoint_sha` 非法，必须为非空字符串或 null，"
+                f"当前值={checkpoint_raw!r}"
+            )
+            last_checkpoint_sha = None
+
     if not errors:
         if inflight_role is None:
             if run_id is not None:
@@ -733,7 +750,88 @@ def _normalize_state(raw: Any) -> dict[str, Any]:
         "run_id": run_id,
         "started_at": started_at,
         "attempt": attempt,
+        "last_checkpoint_sha": last_checkpoint_sha,
     }
+
+
+def _run_git(workdir: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["git", *args], cwd=workdir, check=False, capture_output=True, text=True)
+
+
+def _emit_checkpoint_failure(reason: str, details: str = "") -> None:
+    print(f"⚠️ Git checkpoint 创建失败（不中断流程）: {reason}")
+    detail = details.strip()
+    if detail:
+        print(f"   [DETAIL] {detail}")
+    print("   [NEXT_STEP] git status")
+    print('   [NEXT_STEP] git config user.name "<your-name>"')
+    print('   [NEXT_STEP] git config user.email "<your-email>"')
+
+
+def try_create_validator_checkpoint(workdir: Path, cycle: int, run_id: str) -> str | None:
+    run_token = run_id.strip() if isinstance(run_id, str) else ""
+    if not run_token:
+        _emit_checkpoint_failure("run_id 为空，无法生成可审计元数据")
+        return None
+
+    probe = _run_git(workdir, ["rev-parse", "--is-inside-work-tree"])
+    if probe.returncode != 0 or probe.stdout.strip().lower() != "true":
+        print("ℹ️ 当前工作区不是 Git 仓库，已跳过本轮 checkpoint（不中断流程）。")
+        print("   [NEXT_STEP] 若需启用 checkpoint，请先执行 git init 并创建首个提交")
+        return None
+
+    user_name = _run_git(workdir, ["config", "--get", "user.name"])
+    user_email = _run_git(workdir, ["config", "--get", "user.email"])
+    if (
+        user_name.returncode != 0
+        or not user_name.stdout.strip()
+        or user_email.returncode != 0
+        or not user_email.stdout.strip()
+    ):
+        _emit_checkpoint_failure("缺少 Git 提交身份配置")
+        return None
+
+    stage = _run_git(
+        workdir,
+        ["add", "-A", "--", ".", f":(exclude){RUNTIME_DIR}", f":(exclude){RUNTIME_DIR}/**"],
+    )
+    if stage.returncode != 0:
+        _emit_checkpoint_failure("暂存改动失败", details=stage.stderr or stage.stdout)
+        return None
+
+    has_staged = _run_git(workdir, ["diff", "--cached", "--quiet", "--exit-code"])
+    if has_staged.returncode == 0:
+        print("ℹ️ 本轮无可提交改动（已默认排除 .centaur/），跳过 checkpoint。")
+        return None
+    if has_staged.returncode != 1:
+        _emit_checkpoint_failure("检查暂存区失败", details=has_staged.stderr or has_staged.stdout)
+        return None
+
+    metadata = {
+        "cycle": int(cycle),
+        "role": CHECKPOINT_ROLE,
+        "run_id": run_token,
+        "timestamp": _iso_utc_now(),
+    }
+    metadata_json = json.dumps(metadata, ensure_ascii=False, sort_keys=True)
+    subject = f"centaur checkpoint cycle={cycle} role={CHECKPOINT_ROLE} run_id={run_token}"
+    commit = _run_git(workdir, ["commit", "--no-gpg-sign", "-m", subject, "-m", metadata_json])
+    if commit.returncode != 0:
+        _emit_checkpoint_failure("提交 checkpoint 失败", details=commit.stderr or commit.stdout)
+        return None
+
+    rev = _run_git(workdir, ["rev-parse", "HEAD"])
+    if rev.returncode != 0:
+        _emit_checkpoint_failure("读取 checkpoint SHA 失败", details=rev.stderr or rev.stdout)
+        return None
+    sha = rev.stdout.strip()
+    if not sha:
+        _emit_checkpoint_failure("读取到空 SHA")
+        return None
+
+    print(f"✅ 已创建 Git checkpoint: {sha}")
+    print(f"   [CHECKPOINT_METADATA] {metadata_json}")
+    return sha
 
 
 def save_state(workdir: Path, state: dict[str, Any]) -> None:
@@ -1142,6 +1240,10 @@ def _recover_inflight_role_state(workdir: Path, state: dict[str, Any]) -> dict[s
         return state
 
     _apply_success_transition_from_recovered_role(workdir, state, inflight_role, cycle)
+    if inflight_role == CHECKPOINT_ROLE:
+        checkpoint_sha = try_create_validator_checkpoint(workdir, cycle=cycle, run_id=run_id)
+        if checkpoint_sha:
+            state["last_checkpoint_sha"] = checkpoint_sha
     return state
 
 
@@ -1296,4 +1398,8 @@ def run_workflow(
         state["cycle"] = cycle + 1
         state["next_step"] = "supervisor"
         save_state(base, state)
+        checkpoint_sha = try_create_validator_checkpoint(base, cycle=cycle, run_id=run_id)
+        if checkpoint_sha:
+            state["last_checkpoint_sha"] = checkpoint_sha
+            save_state(base, state)
         sync_task_bus_to_active(base, active_task)
