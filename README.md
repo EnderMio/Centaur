@@ -57,7 +57,7 @@ Centaur 使用“工作区 + 运行态目录”管理项目上下文。
 开发安装（editable）：
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/EnderMio/Centaur.git
 cd Centaur
 python -m pip install -U pip setuptools wheel
 python -m pip install -e . --no-build-isolation
