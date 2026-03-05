@@ -356,6 +356,20 @@ class EngineRuntimeTests(unittest.TestCase):
             self.assertIsNone(state["inflight_role"])
             self.assertEqual(state["attempt"], 0)
 
+    def test_sh_g2_load_state_routes_worker_nonzero_role_end_to_supervisor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            ensure_runtime_layout(workspace)
+            append_event(workspace, cycle=5, event_type="role_start", role="worker")
+            append_event(workspace, cycle=5, event_type="role_end", role="worker", return_code=7)
+
+            state = load_state(workspace)
+
+            self.assertEqual(state["cycle"], 5)
+            self.assertEqual(state["next_step"], "supervisor")
+            self.assertIsNone(state["inflight_role"])
+            self.assertEqual(state["attempt"], 0)
+
     def test_sh_2_13_load_state_fail_fast_on_invalid_control_schema(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -500,7 +514,7 @@ class EngineRuntimeTests(unittest.TestCase):
             self.assertEqual(observed[1]["inflight_role"], "worker")
             self.assertEqual(observed[1]["attempt"], 2)
 
-    def test_run_workflow_replays_inflight_role_after_keyboard_interrupt(self) -> None:
+    def test_run_workflow_routes_to_supervisor_after_worker_keyboard_interrupt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
             (workspace / "PROPOSAL.md").write_text("proposal", encoding="utf-8")
@@ -533,15 +547,15 @@ class EngineRuntimeTests(unittest.TestCase):
 
             self.assertEqual(first_cm.exception.code, 1)
             self.assertEqual(second_cm.exception.code, 43)
-            self.assertEqual(called_roles, ["Worker", "Worker"])
+            self.assertEqual(called_roles, ["Worker", "Supervisor"])
             self.assertEqual(state_after_first["cycle"], 2)
-            self.assertEqual(state_after_first["next_step"], "worker")
-            self.assertEqual(state_after_first["inflight_role"], "worker")
-            self.assertEqual(state_after_first["attempt"], 1)
+            self.assertEqual(state_after_first["next_step"], "supervisor")
+            self.assertIsNone(state_after_first["inflight_role"])
+            self.assertEqual(state_after_first["attempt"], 0)
             self.assertEqual(observed[1]["cycle"], 2)
-            self.assertEqual(observed[1]["next_step"], "worker")
-            self.assertEqual(observed[1]["inflight_role"], "worker")
-            self.assertEqual(observed[1]["attempt"], 2)
+            self.assertEqual(observed[1]["next_step"], "supervisor")
+            self.assertEqual(observed[1]["inflight_role"], "supervisor")
+            self.assertEqual(observed[1]["attempt"], 1)
 
     def test_run_workflow_replays_inflight_role_when_last_event_not_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -674,6 +688,49 @@ class EngineRuntimeTests(unittest.TestCase):
             self.assertEqual(observed["next_step"], "worker")
             self.assertEqual(observed["inflight_role"], "worker")
 
+    def test_run_workflow_recovers_inflight_worker_failure_to_supervisor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "PROPOSAL.md").write_text("proposal", encoding="utf-8")
+            (workspace / "TASK.md").write_text("# 当前任务 (Task)\n", encoding="utf-8")
+            load_or_init_project_config(workspace)
+            ensure_runtime_layout(workspace)
+
+            (workspace / RUNTIME_DIR / "state.json").write_text(
+                json.dumps(
+                    {
+                        "cycle": 2,
+                        "next_step": "worker",
+                        "inflight_role": "worker",
+                        "run_id": "2-worker-a1-failed",
+                        "started_at": "2026-03-05T00:00:00+00:00",
+                        "attempt": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            append_event(workspace, cycle=2, event_type="role_start", role="worker")
+            append_event(workspace, cycle=2, event_type="role_end", role="worker", return_code=7)
+
+            observed: dict[str, object] = {}
+            called_roles: list[str] = []
+
+            def _fake_run_agent(role: str, *_args, **_kwargs) -> None:
+                called_roles.append(role)
+                observed.update(json.loads((workspace / RUNTIME_DIR / "state.json").read_text(encoding="utf-8")))
+                raise SystemExit(31)
+
+            with patch("centaur.engine.run_agent", side_effect=_fake_run_agent):
+                with self.assertRaises(SystemExit) as cm:
+                    run_workflow(workdir=workspace, headless=True)
+
+            self.assertEqual(cm.exception.code, 31)
+            self.assertEqual(called_roles, ["Supervisor"])
+            self.assertEqual(observed["cycle"], 2)
+            self.assertEqual(observed["next_step"], "supervisor")
+            self.assertEqual(observed["inflight_role"], "supervisor")
+            self.assertEqual(observed["attempt"], 1)
+
     def test_run_workflow_clears_transaction_fields_after_role_success(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -761,13 +818,14 @@ class EngineRuntimeTests(unittest.TestCase):
             self.assertIsNone(observed["last_checkpoint_sha"])
             self.assertIn("不是 Git 仓库", output)
 
-    def test_run_workflow_validator_checkpoint_commits_changes_and_persists_sha(self) -> None:
+    def test_run_workflow_cycle_boundary_allows_clean_git_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
             (workspace / "PROPOSAL.md").write_text("proposal", encoding="utf-8")
             (workspace / "TASK.md").write_text("# 当前任务 (Task)\n", encoding="utf-8")
-            tracked_file = workspace / "feature.txt"
-            tracked_file.write_text("v1\n", encoding="utf-8")
+            (workspace / "feature.txt").write_text("v1\n", encoding="utf-8")
+            for filename in ("DESIGN.md", "LESSONS.md", "CODE_MAP.md", "PLAN.md", "PROJECT_STATUS.md"):
+                (workspace / filename).write_text("", encoding="utf-8")
 
             subprocess.run(["git", "init"], cwd=workspace, check=True, capture_output=True, text=True)
             subprocess.run(["git", "config", "user.name", "Centaur Bot"], cwd=workspace, check=True, capture_output=True, text=True)
@@ -778,8 +836,56 @@ class EngineRuntimeTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
             )
-            subprocess.run(["git", "add", "PROPOSAL.md", "TASK.md", "feature.txt"], cwd=workspace, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "add", "."], cwd=workspace, check=True, capture_output=True, text=True)
             subprocess.run(["git", "commit", "-m", "init"], cwd=workspace, check=True, capture_output=True, text=True)
+
+            load_or_init_project_config(workspace)
+            ensure_runtime_layout(workspace)
+            (workspace / RUNTIME_DIR / "state.json").write_text(
+                json.dumps({"cycle": 2, "next_step": "supervisor"}),
+                encoding="utf-8",
+            )
+
+            called_roles: list[str] = []
+
+            def _fake_run_agent(role: str, *_args, **_kwargs) -> None:
+                called_roles.append(role)
+                raise SystemExit(196)
+
+            output_buffer = io.StringIO()
+            with patch("centaur.engine.run_agent", side_effect=_fake_run_agent), redirect_stdout(output_buffer):
+                with self.assertRaises(SystemExit) as cm:
+                    run_workflow(workdir=workspace, headless=True)
+            output = output_buffer.getvalue()
+
+            self.assertEqual(cm.exception.code, 196)
+            self.assertEqual(called_roles, ["Supervisor"])
+            self.assertNotIn("工作树不洁净", output)
+
+    def test_run_workflow_cycle_boundary_blocks_dirty_git_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "PROPOSAL.md").write_text("proposal", encoding="utf-8")
+            (workspace / "TASK.md").write_text("# 当前任务 (Task)\n", encoding="utf-8")
+            tracked_file = workspace / "feature.txt"
+            tracked_file.write_text("v1\n", encoding="utf-8")
+            for filename in ("DESIGN.md", "LESSONS.md", "CODE_MAP.md", "PLAN.md", "PROJECT_STATUS.md"):
+                (workspace / filename).write_text("", encoding="utf-8")
+
+            subprocess.run(["git", "init"], cwd=workspace, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "Centaur Bot"], cwd=workspace, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "config", "user.email", "centaur@example.com"],
+                cwd=workspace,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(["git", "add", "."], cwd=workspace, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=workspace, check=True, capture_output=True, text=True)
+            init_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=workspace, check=True, capture_output=True, text=True
+            ).stdout.strip()
 
             tracked_file.write_text("v1\nv2\n", encoding="utf-8")
             load_or_init_project_config(workspace)
@@ -789,54 +895,136 @@ class EngineRuntimeTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
+            def _fake_run_agent(*_args, **_kwargs) -> None:
+                append_event(workspace, cycle=1, event_type="role_end", role="validator", return_code=0)
+
+            output_buffer = io.StringIO()
+            with patch("centaur.engine.run_agent", side_effect=_fake_run_agent), redirect_stdout(output_buffer):
+                with self.assertRaises(SystemExit) as cm:
+                    run_workflow(workdir=workspace, headless=True)
+            output = output_buffer.getvalue()
+
+            self.assertEqual(cm.exception.code, 1)
+            state = json.loads((workspace / RUNTIME_DIR / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["cycle"], 2)
+            self.assertEqual(state["next_step"], "supervisor")
+            self.assertIsNone(state["inflight_role"])
+            self.assertIsNone(state["run_id"])
+            self.assertIsNone(state["started_at"])
+            self.assertEqual(state["attempt"], 0)
+            self.assertIsNone(state["last_checkpoint_sha"])
+
+            head_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=workspace, check=True, capture_output=True, text=True
+            ).stdout.strip()
+            self.assertEqual(head_sha, init_sha)
+
+            self.assertIn("已阻断进入第 2 轮", output)
+            self.assertIn("feature.txt", output)
+            self.assertIn("[NEXT_STEP] git status", output)
+            self.assertIn("[NEXT_STEP] git add <files>", output)
+            self.assertIn('[NEXT_STEP] git commit -m "<message>"', output)
+
+    def test_run_workflow_cycle_boundary_ignores_centaur_runtime_noise(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "PROPOSAL.md").write_text("proposal", encoding="utf-8")
+            (workspace / "TASK.md").write_text("# 当前任务 (Task)\n", encoding="utf-8")
+            (workspace / "feature.txt").write_text("v1\n", encoding="utf-8")
+            for filename in ("DESIGN.md", "LESSONS.md", "CODE_MAP.md", "PLAN.md", "PROJECT_STATUS.md"):
+                (workspace / filename).write_text("", encoding="utf-8")
+
+            subprocess.run(["git", "init"], cwd=workspace, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "Centaur Bot"], cwd=workspace, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "config", "user.email", "centaur@example.com"],
+                cwd=workspace,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(["git", "add", "."], cwd=workspace, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=workspace, check=True, capture_output=True, text=True)
+
+            load_or_init_project_config(workspace)
+            ensure_runtime_layout(workspace)
+            (workspace / RUNTIME_DIR / "state.json").write_text(
+                json.dumps({"cycle": 2, "next_step": "supervisor"}),
+                encoding="utf-8",
+            )
+            (workspace / RUNTIME_DIR / "noise.log").write_text("runtime-noise\n", encoding="utf-8")
+
+            called_roles: list[str] = []
+
+            def _fake_run_agent(role: str, *_args, **_kwargs) -> None:
+                called_roles.append(role)
+                raise SystemExit(197)
+
+            output_buffer = io.StringIO()
+            with patch("centaur.engine.run_agent", side_effect=_fake_run_agent), redirect_stdout(output_buffer):
+                with self.assertRaises(SystemExit) as cm:
+                    run_workflow(workdir=workspace, headless=True)
+            output = output_buffer.getvalue()
+
+            self.assertEqual(cm.exception.code, 197)
+            self.assertEqual(called_roles, ["Supervisor"])
+            self.assertNotIn("工作树不洁净", output)
+
+    def test_run_workflow_cycle_boundary_only_applies_on_round_transition(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "PROPOSAL.md").write_text("proposal", encoding="utf-8")
+            (workspace / "TASK.md").write_text("# 当前任务 (Task)\n", encoding="utf-8")
+            tracked_file = workspace / "feature.txt"
+            tracked_file.write_text("v1\n", encoding="utf-8")
+            for filename in ("DESIGN.md", "LESSONS.md", "CODE_MAP.md", "PLAN.md", "PROJECT_STATUS.md"):
+                (workspace / filename).write_text("", encoding="utf-8")
+
+            subprocess.run(["git", "init"], cwd=workspace, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "Centaur Bot"], cwd=workspace, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "config", "user.email", "centaur@example.com"],
+                cwd=workspace,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(["git", "add", "."], cwd=workspace, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=workspace, check=True, capture_output=True, text=True)
+            tracked_file.write_text("v1\ndirty\n", encoding="utf-8")
+
+            load_or_init_project_config(workspace)
+            ensure_runtime_layout(workspace)
+            (workspace / RUNTIME_DIR / "state.json").write_text(
+                json.dumps({"cycle": 2, "next_step": "worker"}),
+                encoding="utf-8",
+            )
+
             sync_counter = {"value": 0}
             observed: dict[str, object] = {}
 
             def _fake_run_agent(*_args, **_kwargs) -> None:
-                append_event(workspace, cycle=1, event_type="role_end", role="validator", return_code=0)
+                append_event(workspace, cycle=2, event_type="role_end", role="worker", return_code=0)
 
             def _fake_sync_task_bus_to_active(_workdir: Path, _active_task: str) -> None:
                 sync_counter["value"] += 1
                 if sync_counter["value"] == 2:
                     observed.update(json.loads((workspace / RUNTIME_DIR / "state.json").read_text(encoding="utf-8")))
-                    raise SystemExit(96)
+                    raise SystemExit(198)
 
+            output_buffer = io.StringIO()
             with patch("centaur.engine.run_agent", side_effect=_fake_run_agent), patch(
                 "centaur.engine.sync_task_bus_to_active", side_effect=_fake_sync_task_bus_to_active
-            ):
+            ), redirect_stdout(output_buffer):
                 with self.assertRaises(SystemExit) as cm:
                     run_workflow(workdir=workspace, headless=True)
+            output = output_buffer.getvalue()
 
-            self.assertEqual(cm.exception.code, 96)
+            self.assertEqual(cm.exception.code, 198)
             self.assertEqual(observed["cycle"], 2)
-            self.assertEqual(observed["next_step"], "supervisor")
-            checkpoint_sha = str(observed["last_checkpoint_sha"] or "")
-            self.assertTrue(checkpoint_sha)
-
-            head_sha = subprocess.run(
-                ["git", "rev-parse", "HEAD"], cwd=workspace, check=True, capture_output=True, text=True
-            ).stdout.strip()
-            self.assertEqual(checkpoint_sha, head_sha)
-
-            commit_body = subprocess.run(
-                ["git", "log", "-1", "--pretty=%B"], cwd=workspace, check=True, capture_output=True, text=True
-            ).stdout
-            self.assertIn("cycle=1", commit_body)
-            self.assertIn("role=validator", commit_body)
-            self.assertIn("\"cycle\": 1", commit_body)
-            self.assertIn("\"run_id\":", commit_body)
-            self.assertIn("\"timestamp\":", commit_body)
-
-            changed_files = subprocess.run(
-                ["git", "show", "--name-only", "--pretty=format:", "HEAD"],
-                cwd=workspace,
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout
-            self.assertIn("feature.txt", changed_files)
-            self.assertNotIn(".centaur/state.json", changed_files)
-            self.assertNotIn(".centaur/events.jsonl", changed_files)
+            self.assertEqual(observed["next_step"], "validator")
+            self.assertIsNone(observed["inflight_role"])
+            self.assertNotIn("工作树不洁净", output)
 
     def test_run_workflow_blocks_progress_when_task_run_id_evidence_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -882,7 +1070,10 @@ class EngineRuntimeTests(unittest.TestCase):
                         encoding="utf-8",
                     )
 
+                    called_roles: list[str] = []
+
                     def _fake_run_agent(*_args, **_kwargs) -> None:
+                        called_roles.append(str(_args[0]))
                         if case == "return_code_nonzero":
                             append_event(workspace, cycle=2, event_type="role_end", role="worker", return_code=7)
 
@@ -891,9 +1082,11 @@ class EngineRuntimeTests(unittest.TestCase):
                             run_workflow(workdir=workspace, headless=True)
 
                     self.assertEqual(cm.exception.code, 1)
+                    self.assertEqual(called_roles, ["Worker"])
                     state = json.loads((workspace / RUNTIME_DIR / "state.json").read_text(encoding="utf-8"))
                     self.assertEqual(state["cycle"], 2)
-                    self.assertEqual(state["next_step"], "worker")
+                    expected_next_step = "supervisor" if case == "return_code_nonzero" else "worker"
+                    self.assertEqual(state["next_step"], expected_next_step)
                     self.assertIsNone(state["inflight_role"])
                     self.assertIsNone(state["run_id"])
                     self.assertIsNone(state["started_at"])
@@ -986,7 +1179,9 @@ class EngineRuntimeTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with patch("centaur.engine.try_create_validator_checkpoint", return_value=None):
+            with patch("centaur.engine.enforce_next_cycle_git_worktree_guard", return_value=None), patch(
+                "centaur.engine.try_create_validator_checkpoint", return_value=None
+            ):
                 with self.assertRaises(SystemExit):
                     run_workflow(workdir=workspace, headless=True)
 

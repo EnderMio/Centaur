@@ -49,6 +49,10 @@ ROLE_LABELS = {
 TRANSACTION_STATE_FIELDS = ("inflight_role", "run_id", "started_at", "attempt")
 TASK_COMPLETION_EVIDENCE_PREFIX = "[CENTAUR_ROLE_COMPLETION] "
 CHECKPOINT_ROLE = "validator"
+WORKER_RESULT_SUCCESS = "success"
+WORKER_RESULT_FAILED = "failed"
+WORKER_RESULT_BLOCKED = "blocked"
+WORKER_RESULT_INCOMPLETE = "incomplete"
 
 
 def is_framework_repo_root(workdir: Path) -> bool:
@@ -758,6 +762,49 @@ def _run_git(workdir: Path, args: list[str]) -> subprocess.CompletedProcess[str]
     return subprocess.run(["git", *args], cwd=workdir, check=False, capture_output=True, text=True)
 
 
+def _is_git_workspace(workdir: Path) -> bool:
+    probe = _run_git(workdir, ["rev-parse", "--is-inside-work-tree"])
+    return probe.returncode == 0 and probe.stdout.strip().lower() == "true"
+
+
+def _git_status_excluding_runtime(workdir: Path) -> subprocess.CompletedProcess[str]:
+    return _run_git(
+        workdir,
+        ["status", "--porcelain", "--untracked-files=all", "--", ".", f":(exclude){RUNTIME_DIR}", f":(exclude){RUNTIME_DIR}/**"],
+    )
+
+
+def enforce_next_cycle_git_worktree_guard(workdir: Path, next_cycle: int) -> None:
+    if not _is_git_workspace(workdir):
+        print("ℹ️ 当前工作区不是 Git 仓库，已跳过跨轮次工作树闸门检查。")
+        return
+
+    status = _git_status_excluding_runtime(workdir)
+    if status.returncode != 0:
+        print("❌ Git 工作树闸门检查失败，已阻断进入下一轮。")
+        detail = (status.stderr or status.stdout).strip()
+        if detail:
+            print(f"   [DETAIL] {detail}")
+        print("   [NEXT_STEP] git status")
+        print("   [NEXT_STEP] git add <files>")
+        print('   [NEXT_STEP] git commit -m "<message>"')
+        raise SystemExit(1)
+
+    dirty_lines = [line for line in status.stdout.splitlines() if line.strip()]
+    if not dirty_lines:
+        return
+
+    print(f"❌ 检测到跨轮次前 Git 工作树不洁净（已排除 .centaur/），已阻断进入第 {int(next_cycle)} 轮。")
+    for line in dirty_lines[:20]:
+        print(f"   [DIRTY] {line}")
+    if len(dirty_lines) > 20:
+        print(f"   [DIRTY] ... 其余 {len(dirty_lines) - 20} 条已省略")
+    print("   [NEXT_STEP] git status")
+    print("   [NEXT_STEP] git add <files>")
+    print('   [NEXT_STEP] git commit -m "<message>"')
+    raise SystemExit(1)
+
+
 def _emit_checkpoint_failure(reason: str, details: str = "") -> None:
     print(f"⚠️ Git checkpoint 创建失败（不中断流程）: {reason}")
     detail = details.strip()
@@ -774,8 +821,7 @@ def try_create_validator_checkpoint(workdir: Path, cycle: int, run_id: str) -> s
         _emit_checkpoint_failure("run_id 为空，无法生成可审计元数据")
         return None
 
-    probe = _run_git(workdir, ["rev-parse", "--is-inside-work-tree"])
-    if probe.returncode != 0 or probe.stdout.strip().lower() != "true":
+    if not _is_git_workspace(workdir):
         print("ℹ️ 当前工作区不是 Git 仓库，已跳过本轮 checkpoint（不中断流程）。")
         print("   [NEXT_STEP] 若需启用 checkpoint，请先执行 git init 并创建首个提交")
         return None
@@ -930,6 +976,8 @@ def _infer_state_from_events(workdir: Path) -> dict[str, Any] | None:
                 return _build_state(cycle=cycle, next_step="validator")
             if role == "validator":
                 return _build_state(cycle=cycle + 1, next_step="supervisor")
+        if role == "worker":
+            return _build_state(cycle=cycle, next_step="supervisor")
         return _build_state(cycle=cycle, next_step=role)
 
     return None
@@ -1133,6 +1181,64 @@ def _has_successful_role_end_event(workdir: Path, cycle: int, role: str) -> bool
     return False
 
 
+def _latest_role_event_signal(workdir: Path, cycle: int, role: str) -> tuple[str | None, int | None]:
+    event_path = get_events_path(workdir)
+    if not event_path.exists():
+        return None, None
+
+    target_cycle = int(cycle)
+    target_role = _normalize_role_token(role)
+    try:
+        lines = event_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None, None
+
+    for raw_line in reversed(lines):
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        event_type = str(payload.get("event_type", "")).strip().lower()
+        if event_type not in {"role_start", "role_end"}:
+            continue
+        if _coerce_int(payload.get("cycle")) != target_cycle:
+            continue
+        if _normalize_role_token(payload.get("role")) != target_role:
+            continue
+        if event_type != "role_end":
+            return event_type, None
+        return event_type, _coerce_int(payload.get("return_code"))
+    return None, None
+
+
+def _classify_worker_outcome(workdir: Path, cycle: int, run_id: str) -> tuple[str, list[str]]:
+    event_type, return_code = _latest_role_event_signal(workdir, cycle=cycle, role="worker")
+    if event_type != "role_end":
+        return WORKER_RESULT_INCOMPLETE, ["缺少 cycle 对齐的 worker role_end(return_code) 结构化证据"]
+
+    if return_code is None:
+        return WORKER_RESULT_INCOMPLETE, ["worker role_end 缺少有效 return_code"]
+
+    if return_code != 0:
+        result = WORKER_RESULT_BLOCKED if return_code == 130 else WORKER_RESULT_FAILED
+        return result, [f"worker role_end(return_code={return_code})"]
+
+    run_token = run_id.strip() if isinstance(run_id, str) else ""
+    if not run_token:
+        return WORKER_RESULT_INCOMPLETE, ["worker run_id 为空，无法对齐 TASK.md 机审完成证据"]
+    if not _task_has_completion_evidence(workdir, cycle=cycle, role="worker", run_id=run_token):
+        return (
+            WORKER_RESULT_INCOMPLETE,
+            [f"TASK.md 缺少 cycle={cycle}, role=worker, run_id={run_token}, status=completed 机审证据"],
+        )
+    return WORKER_RESULT_SUCCESS, []
+
+
 def _verify_role_dual_gate(workdir: Path, cycle: int, role: str, run_id: str) -> list[str]:
     failures: list[str] = []
     if not _has_successful_role_end_event(workdir, cycle=cycle, role=role):
@@ -1161,6 +1267,32 @@ def _fail_dual_gate_and_stop(
     sync_task_bus_to_active(workdir, active_task)
     print(f"❌ 双闸门校验失败，已阻断推进: cycle={cycle}, role={role}, run_id={run_id}")
     for reason in failures:
+        print(f"   - {reason}")
+    raise SystemExit(1)
+
+
+def _route_worker_non_success_and_stop(
+    workdir: Path,
+    state: dict[str, Any],
+    cycle: int,
+    run_id: str,
+    active_task: str,
+    outcome: str,
+    reasons: list[str],
+) -> None:
+    _clear_role_transaction(state)
+    state["cycle"] = cycle
+    if outcome in {WORKER_RESULT_FAILED, WORKER_RESULT_BLOCKED}:
+        state["next_step"] = "supervisor"
+        message = "⚠️ Worker 明确失败/阻塞，已跳过 Validator 并回流 Supervisor。"
+    else:
+        state["next_step"] = "worker"
+        message = "❌ Worker 完成证据未闭环，已阻断 Validator 并保持 Worker 可重放。"
+    save_state(workdir, state)
+    sync_task_bus_to_active(workdir, active_task)
+    print(message)
+    print(f"   - cycle={cycle}, run_id={run_id}, outcome={outcome}")
+    for reason in reasons:
         print(f"   - {reason}")
     raise SystemExit(1)
 
@@ -1229,6 +1361,18 @@ def _recover_inflight_role_state(workdir: Path, state: dict[str, Any]) -> dict[s
 
     cycle = int(state["cycle"])
     run_id = str(state.get("run_id") or "")
+
+    if inflight_role == "worker":
+        outcome, _reasons = _classify_worker_outcome(workdir, cycle=cycle, run_id=run_id)
+        if outcome == WORKER_RESULT_SUCCESS:
+            _apply_success_transition_from_recovered_role(workdir, state, inflight_role, cycle)
+            return state
+        if outcome in {WORKER_RESULT_FAILED, WORKER_RESULT_BLOCKED}:
+            _clear_role_transaction(state)
+            state["next_step"] = "supervisor"
+            return state
+        state["next_step"] = inflight_role
+        return state
 
     if not _has_successful_role_end_event(workdir, cycle=cycle, role=inflight_role):
         state["next_step"] = inflight_role
@@ -1324,6 +1468,8 @@ def run_workflow(
         print("█" * 60)
 
         if next_step == "supervisor":
+            if cycle > 1:
+                enforce_next_cycle_git_worktree_guard(base, next_cycle=cycle)
             _start_role_transaction(state, role="supervisor", cycle=cycle)
             save_state(base, state)
             run_id = str(state.get("run_id") or "")
@@ -1357,18 +1503,32 @@ def run_workflow(
             _start_role_transaction(state, role="worker", cycle=cycle)
             save_state(base, state)
             run_id = str(state.get("run_id") or "")
-            run_agent("Worker", "WORKER.md", base, prompt_mode, cycle=cycle, headless=headless)
+            try:
+                run_agent("Worker", "WORKER.md", base, prompt_mode, cycle=cycle, headless=headless)
+            except SystemExit:
+                outcome, reasons = _classify_worker_outcome(base, cycle=cycle, run_id=run_id)
+                if outcome in {WORKER_RESULT_FAILED, WORKER_RESULT_BLOCKED}:
+                    _route_worker_non_success_and_stop(
+                        workdir=base,
+                        state=state,
+                        cycle=cycle,
+                        run_id=run_id,
+                        active_task=active_task,
+                        outcome=outcome,
+                        reasons=reasons,
+                    )
+                raise
             append_task_completion_evidence(base, cycle=cycle, role="worker", run_id=run_id)
-            gate_failures = _verify_role_dual_gate(base, cycle=cycle, role="worker", run_id=run_id)
-            if gate_failures:
-                _fail_dual_gate_and_stop(
+            outcome, reasons = _classify_worker_outcome(base, cycle=cycle, run_id=run_id)
+            if outcome != WORKER_RESULT_SUCCESS:
+                _route_worker_non_success_and_stop(
                     workdir=base,
                     state=state,
                     cycle=cycle,
-                    role="worker",
                     run_id=run_id,
                     active_task=active_task,
-                    failures=gate_failures,
+                    outcome=outcome,
+                    reasons=reasons,
                 )
             _clear_role_transaction(state)
             state["next_step"] = "validator"
@@ -1398,6 +1558,7 @@ def run_workflow(
         state["cycle"] = cycle + 1
         state["next_step"] = "supervisor"
         save_state(base, state)
+        enforce_next_cycle_git_worktree_guard(base, next_cycle=cycle + 1)
         checkpoint_sha = try_create_validator_checkpoint(base, cycle=cycle, run_id=run_id)
         if checkpoint_sha:
             state["last_checkpoint_sha"] = checkpoint_sha
