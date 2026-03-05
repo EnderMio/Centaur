@@ -296,6 +296,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         _resolve_workspace(args.path, args.workspace),
         start_step=args.from_role,
         allow_repo_root=args.allow_repo_root,
+        headless=args.headless,
     )
     return 0
 
@@ -510,6 +511,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-repo-root",
         action="store_true",
         help="Allow running in Centaur source repository root (not recommended).",
+    )
+    run_parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Run without interactive TTY (use `codex exec` for automation/CI).",
     )
     run_parser.set_defaults(func=cmd_run)
 
