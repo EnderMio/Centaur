@@ -1,3 +1,5 @@
+from contextlib import redirect_stdout
+import io
 import json
 import subprocess
 import tempfile
@@ -12,11 +14,14 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from centaur.engine import (  # noqa: E402
     DEFAULT_TASK_NAME,
+    EVENTS_FILE,
     PROJECT_SCHEMA_VERSION,
     RUNTIME_DIR,
+    ensure_runtime_layout,
     load_or_init_project_config,
     migrate_schema,
     run_agent,
+    run_workflow,
     sync_task_bus_to_active,
     task_file_path,
     validate_task_name,
@@ -132,6 +137,82 @@ class EngineRuntimeTests(unittest.TestCase):
             self.assertEqual(payload["return_code"], 3)
             self.assertEqual(payload["stdout"], "partial\n")
             self.assertEqual(payload["stderr"], "boom\n")
+
+    @patch("centaur.engine.resolve_prompt_content", return_value=("role prompt", "测试模板"))
+    @patch("centaur.engine.subprocess.run")
+    def test_event_log_jsonl_append_and_contract(self, mock_run, _mock_resolve_prompt) -> None:
+        mock_run.side_effect = [
+            subprocess.CompletedProcess(
+                args=["codex", "--full-auto", "role prompt"],
+                returncode=0,
+                stdout="validator-ok\n",
+                stderr="",
+            ),
+            subprocess.CompletedProcess(
+                args=["codex", "--full-auto", "role prompt"],
+                returncode=2,
+                stdout="supervisor-partial\n",
+                stderr="supervisor-error\n",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "PROPOSAL.md").write_text("proposal", encoding="utf-8")
+            (workspace / "TASK.md").write_text("# 当前任务 (Task)\n", encoding="utf-8")
+            load_or_init_project_config(workspace)
+            ensure_runtime_layout(workspace)
+            (workspace / RUNTIME_DIR / "state.json").write_text(
+                json.dumps({"cycle": 1, "next_step": "validator"}),
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(SystemExit):
+                run_workflow(workdir=workspace)
+
+            events_path = workspace / RUNTIME_DIR / EVENTS_FILE
+            self.assertTrue(events_path.exists())
+            lines = [line for line in events_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertGreaterEqual(len(lines), 6)
+            events = [json.loads(line) for line in lines]
+
+            event_types = {event["event_type"] for event in events}
+            self.assertIn("cycle_start", event_types)
+            self.assertIn("cycle_end", event_types)
+            self.assertIn("role_start", event_types)
+            self.assertIn("role_end", event_types)
+
+            for event in events:
+                self.assertIn("timestamp", event)
+                self.assertIn("cycle", event)
+                self.assertIn("event_type", event)
+                if event["event_type"] in {"role_start", "role_end"}:
+                    self.assertIn("role", event)
+                if event["event_type"] == "role_end":
+                    self.assertIn("return_code", event)
+
+    @patch("centaur.engine.resolve_prompt_content", return_value=("worker prompt", "测试模板"))
+    @patch("centaur.engine.subprocess.run")
+    def test_fail_fast_when_event_log_cannot_be_written(self, mock_run, _mock_resolve_prompt) -> None:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=["codex", "--full-auto", "worker prompt"],
+            returncode=0,
+            stdout="ok\n",
+            stderr="",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            ensure_runtime_layout(workspace)
+            events_path = workspace / RUNTIME_DIR / EVENTS_FILE
+            events_path.mkdir()
+
+            output_buffer = io.StringIO()
+            with redirect_stdout(output_buffer):
+                with self.assertRaises(SystemExit) as cm:
+                    run_agent("Worker", "WORKER.md", workspace, "global", cycle=1)
+            output = output_buffer.getvalue()
+
+            self.assertEqual(cm.exception.code, 1)
+            self.assertIn("写入事件日志失败", output)
 
 
 if __name__ == "__main__":

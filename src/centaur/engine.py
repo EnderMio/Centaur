@@ -29,6 +29,7 @@ LEGACY_STATE_FILE = ".centaur_state.json"
 LEGACY_PROJECT_FILE = ".centaur_project.json"
 TASKS_DIR = "tasks"
 LOGS_DIR = "logs"
+EVENTS_FILE = "events.jsonl"
 DEFAULT_TASK_NAME = "default"
 TASK_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 ROLE_LABELS = {
@@ -97,6 +98,40 @@ def _iso_utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def get_events_path(workdir: Path) -> Path:
+    return _runtime_dir(workdir) / EVENTS_FILE
+
+
+def append_event(
+    workdir: Path,
+    cycle: int,
+    event_type: str,
+    role: str | None = None,
+    return_code: int | None = None,
+) -> None:
+    ensure_runtime_layout(workdir)
+    event_path = get_events_path(workdir)
+    payload: dict[str, Any] = {
+        "timestamp": _iso_utc_now(),
+        "cycle": int(cycle),
+        "event_type": event_type,
+    }
+    if role is not None:
+        payload["role"] = role
+    if return_code is not None:
+        payload["return_code"] = int(return_code)
+
+    try:
+        with event_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        print(
+            f"❌ 写入事件日志失败: {event_path}（{exc}）。"
+            f"请检查目录权限与磁盘空间，确保 `{event_path.parent}` 可写。"
+        )
+        raise SystemExit(1)
+
+
 def _write_role_execution_log(
     workdir: Path,
     role: str,
@@ -144,10 +179,13 @@ def run_agent(role: str, prompt_filename: str, workdir: Path, prompt_mode: str, 
     command = ["codex", "--full-auto", prompt_content]
     start_time = _iso_utc_now()
     end_time = start_time
-    return_code: int | None = None
+    return_code = 1
     stdout_text = ""
     stderr_text = ""
+    role_started = False
     try:
+        append_event(workdir, cycle=cycle, event_type="role_start", role=role)
+        role_started = True
         completed = subprocess.run(command, check=False, cwd=workdir, capture_output=True, text=True)
         end_time = _iso_utc_now()
         return_code = completed.returncode
@@ -163,11 +201,13 @@ def run_agent(role: str, prompt_filename: str, workdir: Path, prompt_mode: str, 
         print(f"[✅] {role} 运行结束。")
     except FileNotFoundError:
         end_time = _iso_utc_now()
+        return_code = 127
         stderr_text = "未找到 `codex` 命令"
         print("❌ 未找到 `codex` 命令，请先安装并配置 Codex CLI。")
         raise SystemExit(1)
     except KeyboardInterrupt:
         end_time = _iso_utc_now()
+        return_code = 130
         stderr_text = "执行被手动中止"
         print(f"\n[⚠️] 手动中止 {role}。")
         raise SystemExit(1)
@@ -183,6 +223,8 @@ def run_agent(role: str, prompt_filename: str, workdir: Path, prompt_mode: str, 
             stdout=stdout_text,
             stderr=stderr_text,
         )
+        if role_started:
+            append_event(workdir, cycle=cycle, event_type="role_end", role=role, return_code=return_code)
 
 
 def human_gate() -> None:
@@ -612,9 +654,13 @@ def run_workflow(
     print(f"🧷 当前任务: {active_task}")
     print(f"♻️ 自动恢复状态：第 {state['cycle']} 轮，下一角色 {ROLE_LABELS[state['next_step']]}")
 
+    active_cycle: int | None = None
     while True:
         cycle = int(state["cycle"])
         next_step = str(state["next_step"])
+        if active_cycle != cycle:
+            append_event(base, cycle=cycle, event_type="cycle_start")
+            active_cycle = cycle
 
         print(f"\n{'█' * 60}")
         print(f"🔄 第 {cycle} 轮开发周期 | 当前阶段: {ROLE_LABELS[next_step]}")
@@ -643,6 +689,7 @@ def run_workflow(
 
         print("\n🔍 Validator 正在审查 Worker 的代码与数据契约...")
         run_agent("Validator", "VALIDATOR.md", base, prompt_mode, cycle=cycle)
+        append_event(base, cycle=cycle, event_type="cycle_end")
         state["cycle"] = cycle + 1
         state["next_step"] = "supervisor"
         save_state(base, state)
