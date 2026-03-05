@@ -79,3 +79,9 @@
 3. **静态隔离**：Supervisor 基于日志与代码路径锁定唯一根因假设。
 4. **最小修复**：Supervisor 下发“外科手术式”任务，Worker 实施最小补丁。
 5. **双层验证**：Worker 做局部验证；Validator 做契约审查与回归复核，未通过则驳回并回流到下一轮。
+
+## 6. 验收契约冲突处理 (Spec Conflict Handling)
+
+1. **结构化契约优先**：若 `TASK.md` 存在 `[CENTAUR_TASK_CONTRACT]`，以其机审结果为准。
+2. **冲突优先级**：`forbidden_delta > allowed_delta > wording`。
+3. **结论分流**：契约自冲突命中 `BLOCKED_SPEC`，不得记为 Worker 实现失败。

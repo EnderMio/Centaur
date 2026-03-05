@@ -155,6 +155,7 @@ centaur workspace list --root ./workspaces
 centaur task list --workspace <path>
 centaur task new <task_name> --workspace <path> [--switch] [--from-current] [--force]
 centaur task switch <task_name> --workspace <path>
+centaur task lint --workspace <path>
 ```
 
 迁移控制面：
@@ -197,5 +198,14 @@ centaur version
 - 随时可用 `Ctrl+C` 中止流程。
 - 重新执行 `centaur run --workspace <path>` 即可按 `state.json` 断点续跑。
 - 需要强制角色入口时使用 `--from-role`。
+
+### 验收契约机审
+
+- `TASK.md` 支持结构化契约前缀行：`[CENTAUR_TASK_CONTRACT] {json}`。
+- 推荐在派单时声明 `unit/allowed_delta/forbidden_delta/precedence`，由 `centaur task lint` 机审。
+- `run` 在 Worker 启动前按 `task_contract_mode` 执行契约闸门：
+  - `enforce`：冲突即阻断并回流 Supervisor（`BLOCKED_SPEC`）。
+  - `warn`：仅告警，不阻断。
+  - `off`：关闭契约检查。
 
 Centaur 的价值在于把 AI 协作纳入工程治理：流程可审计，状态可恢复，决策可追踪。

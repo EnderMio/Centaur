@@ -23,7 +23,7 @@ TRANSACTIONAL_ROLES = ("supervisor", "worker", "validator")
 PROMPT_MODE_GLOBAL = "global"
 PROMPT_MODE_FROZEN = "frozen"
 PROMPT_MODES = (PROMPT_MODE_GLOBAL, PROMPT_MODE_FROZEN)
-PROJECT_SCHEMA_VERSION = 2
+PROJECT_SCHEMA_VERSION = 3
 PROMPT_SET_VERSION = "2026-03-02"
 RUNTIME_DIR = ".centaur"
 STATE_FILE = "state.json"
@@ -48,11 +48,21 @@ ROLE_LABELS = {
 }
 TRANSACTION_STATE_FIELDS = ("inflight_role", "run_id", "started_at", "attempt")
 TASK_COMPLETION_EVIDENCE_PREFIX = "[CENTAUR_ROLE_COMPLETION] "
+TASK_CONTRACT_PREFIX = "[CENTAUR_TASK_CONTRACT] "
 CHECKPOINT_ROLE = "validator"
 WORKER_RESULT_SUCCESS = "success"
 WORKER_RESULT_FAILED = "failed"
 WORKER_RESULT_BLOCKED = "blocked"
 WORKER_RESULT_INCOMPLETE = "incomplete"
+TASK_CONTRACT_MODE_OFF = "off"
+TASK_CONTRACT_MODE_WARN = "warn"
+TASK_CONTRACT_MODE_ENFORCE = "enforce"
+TASK_CONTRACT_MODES = (
+    TASK_CONTRACT_MODE_OFF,
+    TASK_CONTRACT_MODE_WARN,
+    TASK_CONTRACT_MODE_ENFORCE,
+)
+TASK_CONTRACT_UNITS = ("text_exact", "set_exact", "set_plus")
 
 
 def is_framework_repo_root(workdir: Path) -> bool:
@@ -478,6 +488,7 @@ def default_project_config(prompt_mode: str | None = None) -> dict[str, Any]:
         "target_repo": "",
         "target_ref": "main",
         "target_version": "",
+        "task_contract_mode": TASK_CONTRACT_MODE_ENFORCE,
     }
 
 
@@ -518,6 +529,10 @@ def _normalize_project_config(raw: dict[str, Any], fallback_mode: str) -> dict[s
     if not isinstance(target_version, str):
         target_version = ""
 
+    task_contract_mode = raw.get("task_contract_mode")
+    if task_contract_mode not in TASK_CONTRACT_MODES:
+        task_contract_mode = TASK_CONTRACT_MODE_ENFORCE
+
     return {
         "schema_version": PROJECT_SCHEMA_VERSION,
         "centaur_version": centaur_version,
@@ -528,6 +543,7 @@ def _normalize_project_config(raw: dict[str, Any], fallback_mode: str) -> dict[s
         "target_repo": target_repo,
         "target_ref": target_ref,
         "target_version": target_version,
+        "task_contract_mode": task_contract_mode,
     }
 
 
@@ -1146,6 +1162,105 @@ def _task_has_completion_evidence(workdir: Path, cycle: int, role: str, run_id: 
     return False
 
 
+def _normalize_task_contract_string_list(value: Any, field_name: str, errors: list[str]) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        errors.append(f"`{field_name}` 必须是字符串数组")
+        return []
+
+    normalized: list[str] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, str) or not item.strip():
+            errors.append(f"`{field_name}[{index}]` 必须是非空字符串")
+            continue
+        normalized.append(item.strip())
+    return normalized
+
+
+def _latest_task_contract_payload(workdir: Path) -> tuple[dict[str, Any] | None, list[str]]:
+    task_path = workdir / "TASK.md"
+    if not task_path.exists():
+        return None, []
+
+    try:
+        lines = task_path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        return None, [f"读取 TASK.md 失败: {exc}"]
+
+    for raw_line in reversed(lines):
+        line = raw_line.strip()
+        if not line.startswith(TASK_CONTRACT_PREFIX):
+            continue
+        payload_text = line[len(TASK_CONTRACT_PREFIX) :].strip()
+        try:
+            payload = json.loads(payload_text)
+        except json.JSONDecodeError as exc:
+            return None, [f"`{TASK_CONTRACT_PREFIX.strip()}` JSON 非法: {exc}"]
+        if not isinstance(payload, dict):
+            return None, [f"`{TASK_CONTRACT_PREFIX.strip()}` 载荷必须是 JSON 对象"]
+        return payload, []
+    return None, []
+
+
+def lint_task_contract(workdir: Path) -> tuple[list[str], list[str], dict[str, Any] | None]:
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    payload, parse_errors = _latest_task_contract_payload(workdir)
+    if parse_errors:
+        return parse_errors, warnings, None
+    if payload is None:
+        warnings.append(f"TASK.md 未声明 `{TASK_CONTRACT_PREFIX.strip()}` 结构化契约，将沿用自然语言验收。")
+        return errors, warnings, None
+
+    version = _coerce_int(payload.get("version"))
+    if version is None or version <= 0:
+        errors.append("`version` 必须是正整数")
+        version = 1
+
+    unit = str(payload.get("unit", "")).strip().lower()
+    if unit not in TASK_CONTRACT_UNITS:
+        errors.append(f"`unit` 非法，必须是 {TASK_CONTRACT_UNITS}")
+        unit = ""
+
+    allowed_delta = _normalize_task_contract_string_list(payload.get("allowed_delta"), "allowed_delta", errors)
+    forbidden_delta = _normalize_task_contract_string_list(payload.get("forbidden_delta"), "forbidden_delta", errors)
+
+    if unit == "text_exact" and allowed_delta:
+        errors.append("`unit=text_exact` 与 `allowed_delta` 冲突：逐字一致场景不允许声明新增差异")
+
+    overlap = sorted(set(allowed_delta) & set(forbidden_delta))
+    if overlap:
+        errors.append("`allowed_delta` 与 `forbidden_delta` 存在重叠: " + ", ".join(overlap))
+
+    if unit == "set_plus" and not allowed_delta:
+        errors.append("`unit=set_plus` 必须声明非空 `allowed_delta`")
+
+    precedence = payload.get("precedence")
+    if precedence is None:
+        normalized_precedence = ["forbidden", "allowed", "wording"]
+    elif (
+        isinstance(precedence, list)
+        and all(isinstance(item, str) and item.strip() for item in precedence)
+        and set(item.strip().lower() for item in precedence) == {"forbidden", "allowed", "wording"}
+    ):
+        normalized_precedence = [item.strip().lower() for item in precedence]
+    else:
+        errors.append("`precedence` 非法，必须包含且仅包含 `forbidden/allowed/wording`")
+        normalized_precedence = ["forbidden", "allowed", "wording"]
+
+    normalized_contract = {
+        "version": version,
+        "unit": unit,
+        "baseline": str(payload.get("baseline", "")).strip(),
+        "allowed_delta": sorted(dict.fromkeys(allowed_delta)),
+        "forbidden_delta": sorted(dict.fromkeys(forbidden_delta)),
+        "precedence": normalized_precedence,
+    }
+    return errors, warnings, normalized_contract
+
+
 def _has_successful_role_end_event(workdir: Path, cycle: int, role: str) -> bool:
     event_path = get_events_path(workdir)
     if not event_path.exists():
@@ -1271,6 +1386,26 @@ def _fail_dual_gate_and_stop(
     raise SystemExit(1)
 
 
+def _route_blocked_spec_and_stop(
+    workdir: Path,
+    state: dict[str, Any],
+    cycle: int,
+    active_task: str,
+    reasons: list[str],
+) -> None:
+    _clear_role_transaction(state)
+    state["cycle"] = cycle
+    state["next_step"] = "supervisor"
+    save_state(workdir, state)
+    sync_task_bus_to_active(workdir, active_task)
+    print("❌ [BLOCKED_SPEC] TASK 验收契约存在冲突，已阻断 Worker 执行并回流 Supervisor。")
+    for reason in reasons:
+        print(f"   - {reason}")
+    print("   [NEXT_STEP] centaur task lint")
+    print("   [NEXT_STEP] 由 Supervisor 先修复 TASK.md 契约歧义，再放行 Worker")
+    raise SystemExit(1)
+
+
 def _route_worker_non_success_and_stop(
     workdir: Path,
     state: dict[str, Any],
@@ -1324,6 +1459,8 @@ def migrate_schema(workdir: Path) -> dict[str, Any]:
         config["target_ref"] = "main"
     if "target_version" not in config or not isinstance(config["target_version"], str):
         config["target_version"] = ""
+    if config.get("task_contract_mode") not in TASK_CONTRACT_MODES:
+        config["task_contract_mode"] = TASK_CONTRACT_MODE_ENFORCE
     save_project_config(workdir, config)
     return config
 
@@ -1437,6 +1574,9 @@ def run_workflow(
     project_config = load_or_init_project_config(base)
     active_task, _ = ensure_active_task_file(base, project_config)
     prompt_mode = str(project_config.get("prompt_mode", PROMPT_MODE_GLOBAL))
+    task_contract_mode = str(project_config.get("task_contract_mode", TASK_CONTRACT_MODE_ENFORCE))
+    if task_contract_mode not in TASK_CONTRACT_MODES:
+        task_contract_mode = TASK_CONTRACT_MODE_ENFORCE
     validate_prompt_mode_env(base, prompt_mode)
     if not headless and not has_interactive_tty():
         print("❌ 当前会话不是交互终端（TTY），默认模式无法运行。")
@@ -1452,6 +1592,7 @@ def run_workflow(
     save_state(base, state)
     sync_task_bus_to_active(base, active_task)
     print(f"🧭 Prompt 模式: {prompt_mode}")
+    print(f"📐 TASK 契约模式: {task_contract_mode}")
     print(f"🧷 当前任务: {active_task}")
     print(f"♻️ 自动恢复状态：第 {state['cycle']} 轮，下一角色 {ROLE_LABELS[state['next_step']]}")
 
@@ -1500,6 +1641,23 @@ def run_workflow(
             continue
 
         if next_step == "worker":
+            if task_contract_mode != TASK_CONTRACT_MODE_OFF:
+                contract_errors, contract_warnings, _contract = lint_task_contract(base)
+                for warning in contract_warnings:
+                    print(f"⚠️ [TASK_CONTRACT] {warning}")
+                if contract_errors:
+                    if task_contract_mode == TASK_CONTRACT_MODE_WARN:
+                        print("⚠️ [TASK_CONTRACT] 检测到契约冲突，当前模式=warn，继续执行。")
+                        for reason in contract_errors:
+                            print(f"   - {reason}")
+                    else:
+                        _route_blocked_spec_and_stop(
+                            workdir=base,
+                            state=state,
+                            cycle=cycle,
+                            active_task=active_task,
+                            reasons=contract_errors,
+                        )
             _start_role_transaction(state, role="worker", cycle=cycle)
             save_state(base, state)
             run_id = str(state.get("run_id") or "")

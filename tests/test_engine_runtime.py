@@ -20,14 +20,17 @@ from centaur.engine import (  # noqa: E402
     PROJECT_SCHEMA_VERSION,
     RUNTIME_DIR,
     SCHEDULER_STATE_FILE,
+    TASK_CONTRACT_MODE_ENFORCE,
     TASK_COMPLETION_EVIDENCE_PREFIX,
     append_event,
     ensure_runtime_layout,
+    lint_task_contract,
     load_state,
     load_or_init_project_config,
     migrate_schema,
     run_agent,
     run_workflow,
+    save_project_config,
     sync_task_bus_to_active,
     task_file_path,
     validate_task_name,
@@ -369,6 +372,63 @@ class EngineRuntimeTests(unittest.TestCase):
             self.assertEqual(state["next_step"], "supervisor")
             self.assertIsNone(state["inflight_role"])
             self.assertEqual(state["attempt"], 0)
+
+    def test_task_contract_lint_detects_text_exact_with_allowed_delta_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "TASK.md").write_text(
+                (
+                    "# 当前任务 (Task)\n"
+                    "[CENTAUR_TASK_CONTRACT] "
+                    '{"version":1,"unit":"text_exact","allowed_delta":["tests/scripts/test_recovery_auto.sh"]}\n'
+                ),
+                encoding="utf-8",
+            )
+
+            errors, warnings, contract = lint_task_contract(workspace)
+
+            self.assertTrue(errors)
+            self.assertIn("`unit=text_exact` 与 `allowed_delta` 冲突", "\n".join(errors))
+            self.assertEqual(warnings, [])
+            self.assertEqual(contract["unit"], "text_exact")
+
+    def test_run_workflow_blocks_worker_when_task_contract_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "PROPOSAL.md").write_text("proposal", encoding="utf-8")
+            (workspace / "TASK.md").write_text(
+                (
+                    "# 当前任务 (Task)\n"
+                    "## 验收标准\n"
+                    "- [ ] demo\n"
+                    "[CENTAUR_TASK_CONTRACT] "
+                    '{"version":1,"unit":"text_exact","allowed_delta":["tests/scripts/test_recovery_auto.sh"]}\n'
+                ),
+                encoding="utf-8",
+            )
+            config = load_or_init_project_config(workspace)
+            config["task_contract_mode"] = TASK_CONTRACT_MODE_ENFORCE
+            save_project_config(workspace, config)
+            ensure_runtime_layout(workspace)
+            (workspace / RUNTIME_DIR / "state.json").write_text(
+                json.dumps({"cycle": 2, "next_step": "worker"}),
+                encoding="utf-8",
+            )
+
+            output_buffer = io.StringIO()
+            with patch("centaur.engine.run_agent") as mock_run_agent, redirect_stdout(output_buffer):
+                with self.assertRaises(SystemExit) as cm:
+                    run_workflow(workdir=workspace, headless=True)
+            output = output_buffer.getvalue()
+
+            self.assertEqual(cm.exception.code, 1)
+            mock_run_agent.assert_not_called()
+            state = json.loads((workspace / RUNTIME_DIR / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["cycle"], 2)
+            self.assertEqual(state["next_step"], "supervisor")
+            self.assertIsNone(state["inflight_role"])
+            self.assertIn("[BLOCKED_SPEC]", output)
+            self.assertIn("centaur task lint", output)
 
     def test_sh_2_13_load_state_fail_fast_on_invalid_control_schema(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -18,6 +18,9 @@ from centaur.engine import (
     RUNTIME_DIR,
     ROLE_ORDER,
     ROLE_TEMPLATE_FILES,
+    TASK_CONTRACT_MODE_ENFORCE,
+    TASK_CONTRACT_MODE_OFF,
+    TASK_CONTRACT_MODE_WARN,
     TASKS_DIR,
     LOGS_DIR,
     STATE_FILE,
@@ -37,6 +40,7 @@ from centaur.engine import (
     save_project_config,
     sync_task_bus_to_active,
     task_file_path,
+    lint_task_contract,
     validate_task_name,
 )
 
@@ -314,6 +318,31 @@ def cmd_task_switch(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_task_lint(args: argparse.Namespace) -> int:
+    target_dir = _resolve_workspace(args.path, args.workspace)
+    if not target_dir.exists():
+        _emit_cli_error(
+            f"工作区不存在: {target_dir}",
+            "请确认路径后重试，或先执行 `centaur init -w <workspace>` 初始化工作区。",
+        )
+        return 1
+
+    errors, warnings, contract = lint_task_contract(target_dir)
+    print(f"🧪 TASK 契约检查: {target_dir / 'TASK.md'}")
+    if contract is not None:
+        print(f"- INFO: unit={contract.get('unit')} | baseline={contract.get('baseline', '')}")
+    for item in warnings:
+        print(f"- WARN: {item}")
+    for item in errors:
+        print(f"- ERROR: {item}")
+
+    if errors:
+        print("结论: BLOCKED_SPEC")
+        return 1
+    print("结论: PASS")
+    return 0
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     run_workflow(
         _resolve_workspace(args.path, args.workspace),
@@ -352,12 +381,17 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         warnings.append(f"未发现 {RUNTIME_PROJECT_PATH}，将按旧项目形态推断 prompt_mode={inferred_mode}。")
         prompt_mode = inferred_mode
         active_task = DEFAULT_TASK_NAME
+        task_contract_mode = TASK_CONTRACT_MODE_ENFORCE
     else:
         prompt_mode = str(config.get("prompt_mode", PROMPT_MODE_GLOBAL))
         active_task = str(config.get("active_task", DEFAULT_TASK_NAME))
+        task_contract_mode = str(config.get("task_contract_mode", TASK_CONTRACT_MODE_ENFORCE))
+        if task_contract_mode not in (TASK_CONTRACT_MODE_OFF, TASK_CONTRACT_MODE_WARN, TASK_CONTRACT_MODE_ENFORCE):
+            task_contract_mode = TASK_CONTRACT_MODE_ENFORCE
         infos.append(f"prompt_mode={prompt_mode}")
         infos.append(f"project_config={target_dir / RUNTIME_PROJECT_PATH}")
         infos.append(f"active_task={active_task}")
+        infos.append(f"task_contract_mode={task_contract_mode}")
         infos.append(f"controller_version={config.get('controller_version', '')}")
         infos.append(f"target_repo={config.get('target_repo', '')}")
         infos.append(f"target_ref={config.get('target_ref', '')}")
@@ -370,6 +404,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     active_task_file = task_file_path(target_dir, active_task)
     if not active_task_file.exists():
         warnings.append(f"active_task 文件不存在: {active_task_file}（运行时会自动补齐）")
+
+    if task_contract_mode != TASK_CONTRACT_MODE_OFF:
+        contract_errors, contract_warnings, _contract = lint_task_contract(target_dir)
+        for warning in contract_warnings:
+            warnings.append(f"TASK 契约: {warning}")
+        if contract_errors:
+            if task_contract_mode == TASK_CONTRACT_MODE_ENFORCE:
+                errors.extend([f"TASK 契约冲突: {item}" for item in contract_errors])
+            else:
+                warnings.extend([f"TASK 契约冲突(未阻断): {item}" for item in contract_errors])
 
     log_writability_error = _doctor_log_dir_writability_error(target_dir)
     if log_writability_error is not None:
@@ -615,6 +659,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Workspace directory override (same purpose as positional `path`).",
     )
     task_switch_parser.set_defaults(func=cmd_task_switch)
+
+    task_lint_parser = task_subparsers.add_parser("lint", help="Validate structured acceptance contract in TASK.md.")
+    task_lint_parser.add_argument("path", nargs="?", default=".", help="Workspace directory (default: current directory).")
+    task_lint_parser.add_argument(
+        "-w",
+        "--workspace",
+        help="Workspace directory override (same purpose as positional `path`).",
+    )
+    task_lint_parser.set_defaults(func=cmd_task_lint)
 
     migrate_parser = subparsers.add_parser("migrate", help="Migrate project metadata and prompt mode.")
     migrate_parser.add_argument("path", nargs="?", default=".", help="Workspace directory (default: current directory).")

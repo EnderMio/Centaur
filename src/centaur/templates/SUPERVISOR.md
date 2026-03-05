@@ -44,6 +44,9 @@
 - [ ] 必须通过的测试或必须没有报错。
 - [ ] 必须创建或修改的具体文件。
 
+## 机审契约
+`[CENTAUR_TASK_CONTRACT] {"version":1,"unit":"set_exact","baseline":"","allowed_delta":[],"forbidden_delta":[],"precedence":["forbidden","allowed","wording"]}`
+
 ---
 ## Worker 反馈区
 **@Worker：请在你的任务结束后，将执行结果、命令行输出或错误日志追加 (Append) 到此分隔线下方。**

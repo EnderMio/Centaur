@@ -71,7 +71,7 @@ class CommandGroupHelpTests(unittest.TestCase):
 
         self.assertEqual(rc, 2)
         self.assertIn("usage: centaur task", output)
-        self.assertIn("{list,new,switch}", output)
+        self.assertIn("{list,new,switch,lint}", output)
 
 
 class ErrorTemplateTests(unittest.TestCase):
@@ -114,6 +114,40 @@ class ErrorTemplateTests(unittest.TestCase):
             self.assertEqual(rc, 1)
             self.assertIn("目录不存在", output)
             self.assert_error_template(output)
+
+
+class TaskLintCommandTests(unittest.TestCase):
+    def test_task_lint_reports_blocked_spec_on_contract_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "TASK.md").write_text(
+                (
+                    "# 当前任务 (Task)\n"
+                    "[CENTAUR_TASK_CONTRACT] "
+                    '{"version":1,"unit":"text_exact","allowed_delta":["tests/scripts/test_recovery_auto.sh"]}\n'
+                ),
+                encoding="utf-8",
+            )
+            output_buffer = io.StringIO()
+            with redirect_stdout(output_buffer):
+                rc = cli.main(["task", "lint", str(workspace)])
+            output = output_buffer.getvalue()
+
+            self.assertEqual(rc, 1)
+            self.assertIn("BLOCKED_SPEC", output)
+            self.assertIn("`unit=text_exact` 与 `allowed_delta` 冲突", output)
+
+    def test_task_lint_passes_without_contract_line(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "TASK.md").write_text("# 当前任务 (Task)\n", encoding="utf-8")
+            output_buffer = io.StringIO()
+            with redirect_stdout(output_buffer):
+                rc = cli.main(["task", "lint", str(workspace)])
+            output = output_buffer.getvalue()
+
+            self.assertEqual(rc, 0)
+            self.assertIn("结论: PASS", output)
 
 
 if __name__ == "__main__":
