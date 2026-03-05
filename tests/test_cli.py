@@ -11,6 +11,7 @@ import sys
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+from centaur import cli  # noqa: E402
 from centaur.cli import cmd_doctor  # noqa: E402
 
 
@@ -49,6 +50,70 @@ class DoctorCommandTests(unittest.TestCase):
             self.assertEqual(rc, 1)
             self.assertIn("日志目录不可写", output)
             self.assertIn("结论: FAIL", output)
+
+
+class CommandGroupHelpTests(unittest.TestCase):
+    def test_workspace_without_subcommand_prints_workspace_help_and_returns_nonzero(self) -> None:
+        output_buffer = io.StringIO()
+        with redirect_stdout(output_buffer):
+            rc = cli.main(["workspace"])
+        output = output_buffer.getvalue()
+
+        self.assertEqual(rc, 2)
+        self.assertIn("usage: centaur workspace", output)
+        self.assertIn("{create,list}", output)
+
+    def test_task_without_subcommand_prints_task_help_and_returns_nonzero(self) -> None:
+        output_buffer = io.StringIO()
+        with redirect_stdout(output_buffer):
+            rc = cli.main(["task"])
+        output = output_buffer.getvalue()
+
+        self.assertEqual(rc, 2)
+        self.assertIn("usage: centaur task", output)
+        self.assertIn("{list,new,switch}", output)
+
+
+class ErrorTemplateTests(unittest.TestCase):
+    def assert_error_template(self, output: str) -> None:
+        self.assertIn("[CLI_ERROR]", output)
+        self.assertIn("[NEXT_STEP]", output)
+
+    def test_workspace_list_missing_root_uses_unified_error_template(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_root = Path(tmp) / "missing-root"
+            output_buffer = io.StringIO()
+            with redirect_stdout(output_buffer):
+                rc = cli.main(["workspace", "list", "--root", str(missing_root)])
+            output = output_buffer.getvalue()
+
+            self.assertEqual(rc, 1)
+            self.assertIn("工作区根目录不存在", output)
+            self.assert_error_template(output)
+
+    def test_task_new_invalid_name_uses_unified_error_template(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            output_buffer = io.StringIO()
+            with redirect_stdout(output_buffer):
+                rc = cli.main(["task", "new", "_invalid", str(workspace)])
+            output = output_buffer.getvalue()
+
+            self.assertEqual(rc, 1)
+            self.assertIn("非法任务名", output)
+            self.assert_error_template(output)
+
+    def test_migrate_missing_path_uses_unified_error_template(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_workspace = Path(tmp) / "missing-workspace"
+            output_buffer = io.StringIO()
+            with redirect_stdout(output_buffer):
+                rc = cli.main(["migrate", str(missing_workspace)])
+            output = output_buffer.getvalue()
+
+            self.assertEqual(rc, 1)
+            self.assertIn("目录不存在", output)
+            self.assert_error_template(output)
 
 
 if __name__ == "__main__":

@@ -181,6 +181,11 @@ def _doctor_log_dir_writability_error(target_dir: Path) -> str | None:
     return None
 
 
+def _emit_cli_error(reason: str, next_step: str) -> None:
+    print(f"[CLI_ERROR] {reason}")
+    print(f"[NEXT_STEP] {next_step}")
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     target_dir = _resolve_workspace(args.path, args.workspace)
     return _init_workspace(target_dir, freeze_prompts=args.freeze_prompts, force=args.force)
@@ -195,7 +200,10 @@ def cmd_workspace_create(args: argparse.Namespace) -> int:
 def cmd_workspace_list(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
     if not root.exists():
-        print(f"❌ 工作区根目录不存在: {root}")
+        _emit_cli_error(
+            f"工作区根目录不存在: {root}",
+            "请检查 --root 路径是否正确，或先执行 `centaur workspace create <name> --root <path>` 创建工作区。",
+        )
         return 1
 
     candidates: list[Path] = []
@@ -223,7 +231,10 @@ def cmd_workspace_list(args: argparse.Namespace) -> int:
 def cmd_task_list(args: argparse.Namespace) -> int:
     target_dir = _resolve_workspace(args.path, args.workspace)
     if not target_dir.exists():
-        print(f"❌ 工作区不存在: {target_dir}")
+        _emit_cli_error(
+            f"工作区不存在: {target_dir}",
+            "请确认路径后重试，或先执行 `centaur init -w <workspace>` 初始化工作区。",
+        )
         return 1
     config = load_or_init_project_config(target_dir)
     active_task, _ = ensure_active_task_file(target_dir, config)
@@ -241,14 +252,20 @@ def cmd_task_list(args: argparse.Namespace) -> int:
 def cmd_task_new(args: argparse.Namespace) -> int:
     target_dir = _resolve_workspace(args.path, args.workspace)
     if not validate_task_name(args.name):
-        print("❌ 非法任务名。允许字母/数字/._-，长度 1-64，且必须以字母或数字开头。")
+        _emit_cli_error(
+            "非法任务名。允许字母/数字/._-，长度 1-64，且必须以字母或数字开头。",
+            "请改用合法任务名后重试，例如 `centaur task new task-001`。",
+        )
         return 1
 
     config = load_or_init_project_config(target_dir)
     ensure_runtime_layout(target_dir)
     target = task_file_path(target_dir, args.name)
     if target.exists() and not args.force:
-        print(f"❌ 任务已存在: {args.name}（如需覆盖请加 --force）")
+        _emit_cli_error(
+            f"任务已存在: {args.name}（如需覆盖请加 --force）",
+            "请改用新任务名，或显式追加 `--force` 后重试。",
+        )
         return 1
 
     bus = target_dir / "TASK.md"
@@ -273,14 +290,20 @@ def cmd_task_new(args: argparse.Namespace) -> int:
 def cmd_task_switch(args: argparse.Namespace) -> int:
     target_dir = _resolve_workspace(args.path, args.workspace)
     if not validate_task_name(args.name):
-        print("❌ 非法任务名。允许字母/数字/._-，长度 1-64，且必须以字母或数字开头。")
+        _emit_cli_error(
+            "非法任务名。允许字母/数字/._-，长度 1-64，且必须以字母或数字开头。",
+            "请改用合法任务名后重试，例如 `centaur task switch task-001`。",
+        )
         return 1
 
     config = load_or_init_project_config(target_dir)
     old_active = str(config.get("active_task", DEFAULT_TASK_NAME))
     target = task_file_path(target_dir, args.name)
     if not target.exists():
-        print(f"❌ 任务不存在: {args.name}（先执行 `centaur task new {args.name}`）")
+        _emit_cli_error(
+            f"任务不存在: {args.name}（先执行 `centaur task new {args.name}`）",
+            f"请先创建任务 `centaur task new {args.name}`，再执行 switch。",
+        )
         return 1
 
     sync_task_bus_to_active(target_dir, old_active)
@@ -308,7 +331,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     infos: list[str] = []
 
     if not target_dir.exists():
-        print(f"❌ 工作区不存在: {target_dir}")
+        _emit_cli_error(
+            f"工作区不存在: {target_dir}",
+            "请确认路径后重试，或先执行 `centaur init -w <workspace>` 初始化工作区。",
+        )
         return 1
 
     if is_framework_repo_root(target_dir):
@@ -363,6 +389,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(f"- ERROR: {item}")
 
     if errors:
+        _emit_cli_error(
+            f"Doctor 检查未通过，共 {len(errors)} 项错误。",
+            "请按上面的 `- ERROR` 项逐条修复后，再执行 `centaur doctor` 复检。",
+        )
         print("结论: FAIL")
         return 1
     print("结论: PASS")
@@ -372,7 +402,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 def cmd_migrate(args: argparse.Namespace) -> int:
     target_dir = _resolve_workspace(args.path, args.workspace)
     if not target_dir.exists():
-        print(f"❌ 目录不存在: {target_dir}")
+        _emit_cli_error(
+            f"目录不存在: {target_dir}",
+            "请确认目标路径后重试，或先执行 `centaur init -w <workspace>` 初始化工作区。",
+        )
         return 1
 
     written: list[str] = []
@@ -445,6 +478,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
 
     workspace_parser = subparsers.add_parser("workspace", help="Workspace management commands.")
+    workspace_parser.set_defaults(group_parser=workspace_parser)
     workspace_subparsers = workspace_parser.add_subparsers(dest="workspace_command")
 
     workspace_create_parser = workspace_subparsers.add_parser("create", help="Create and initialize a new workspace.")
@@ -534,6 +568,7 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_parser.set_defaults(func=cmd_doctor)
 
     task_parser = subparsers.add_parser("task", help="Task bus management commands.")
+    task_parser.set_defaults(group_parser=task_parser)
     task_subparsers = task_parser.add_subparsers(dest="task_command")
 
     task_list_parser = task_subparsers.add_parser("list", help="List tasks and show active task.")
@@ -620,6 +655,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if not hasattr(args, "func"):
+        if hasattr(args, "group_parser"):
+            args.group_parser.print_help()
+            return 2
         parser.print_help()
         return 0
     return args.func(args)
