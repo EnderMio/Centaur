@@ -43,6 +43,7 @@ from centaur.engine import (
 
 RUNTIME_STATE_PATH = f"{RUNTIME_DIR}/{STATE_FILE}"
 RUNTIME_PROJECT_PATH = f"{RUNTIME_DIR}/{PROJECT_FILE}"
+DOCTOR_LOG_WRITE_PROBE = ".doctor_write_probe"
 
 
 def _resolve_workspace(path_arg: str, workspace_arg: str | None) -> Path:
@@ -153,6 +154,31 @@ def _archive_local_role_prompts(target_dir: Path) -> tuple[Path | None, list[str
     for name in local_prompts:
         (target_dir / name).rename(backup_dir / name)
     return backup_dir, local_prompts
+
+
+def _doctor_log_dir_writability_error(target_dir: Path) -> str | None:
+    logs_dir = target_dir / RUNTIME_DIR / LOGS_DIR
+    try:
+        logs_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return f"日志目录不可写: 无法创建 {logs_dir}（{exc}）"
+
+    if not logs_dir.is_dir():
+        return f"日志目录不可写: {logs_dir} 不是目录。"
+
+    probe_path = logs_dir / DOCTOR_LOG_WRITE_PROBE
+    try:
+        with probe_path.open("w", encoding="utf-8") as handle:
+            handle.write("ok\n")
+    except OSError as exc:
+        return f"日志目录不可写: {logs_dir}（{exc}）"
+    finally:
+        try:
+            probe_path.unlink()
+        except OSError:
+            pass
+
+    return None
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -317,6 +343,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     active_task_file = task_file_path(target_dir, active_task)
     if not active_task_file.exists():
         warnings.append(f"active_task 文件不存在: {active_task_file}（运行时会自动补齐）")
+
+    log_writability_error = _doctor_log_dir_writability_error(target_dir)
+    if log_writability_error is not None:
+        errors.append(log_writability_error)
 
     if not codex_available():
         errors.append("未找到 `codex` 命令（run 无法唤醒角色）。")
