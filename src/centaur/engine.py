@@ -6,8 +6,10 @@ import subprocess
 import shutil
 import re
 from datetime import datetime, timezone
+import sys
 from pathlib import Path
 from typing import Any
+import uuid
 
 from centaur import __version__
 
@@ -17,6 +19,7 @@ CORE_FILES = ROLE_TEMPLATE_FILES
 REQUIRED_WORKSPACE_FILES = ("PROPOSAL.md",)
 MEMORY_FILES = ("DESIGN.md", "LESSONS.md", "CODE_MAP.md", "PLAN.md", "PROJECT_STATUS.md")
 ROLE_ORDER = ("supervisor", "human_gate", "worker", "validator")
+TRANSACTIONAL_ROLES = ("supervisor", "worker", "validator")
 PROMPT_MODE_GLOBAL = "global"
 PROMPT_MODE_FROZEN = "frozen"
 PROMPT_MODES = (PROMPT_MODE_GLOBAL, PROMPT_MODE_FROZEN)
@@ -29,15 +32,22 @@ LEGACY_STATE_FILE = ".centaur_state.json"
 LEGACY_PROJECT_FILE = ".centaur_project.json"
 TASKS_DIR = "tasks"
 LOGS_DIR = "logs"
+CONTROL_DIR = "control"
+CONTROL_TASKS_FILE = "tasks.json"
+SCHEDULER_STATE_FILE = "scheduler_state.json"
 EVENTS_FILE = "events.jsonl"
 DEFAULT_TASK_NAME = "default"
 TASK_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+CONTROL_SCHEMA_VERSION = 1
+CONTROL_MODE_SERIAL = "serial"
 ROLE_LABELS = {
     "supervisor": "Supervisor",
     "human_gate": "Human Gate",
     "worker": "Worker",
     "validator": "Validator",
 }
+TRANSACTION_STATE_FIELDS = ("inflight_role", "run_id", "started_at", "attempt")
+TASK_COMPLETION_EVIDENCE_PREFIX = "[CENTAUR_ROLE_COMPLETION] "
 
 
 def is_framework_repo_root(workdir: Path) -> bool:
@@ -142,6 +152,7 @@ def _write_role_execution_log(
     return_code: int | None,
     stdout: str,
     stderr: str,
+    execution_mode: str,
 ) -> None:
     ensure_runtime_layout(workdir)
     filename = f"cycle_{cycle}_{_role_log_filename(role)}"
@@ -153,6 +164,7 @@ def _write_role_execution_log(
         "start_time": start_time,
         "end_time": end_time,
         "return_code": return_code,
+        "execution_mode": execution_mode,
         "stdout": stdout,
         "stderr": stderr,
     }
@@ -162,7 +174,14 @@ def _write_role_execution_log(
         print(f"[⚠️] 写入角色执行日志失败: {exc}")
 
 
-def run_agent(role: str, prompt_filename: str, workdir: Path, prompt_mode: str, cycle: int = 0) -> None:
+def run_agent(
+    role: str,
+    prompt_filename: str,
+    workdir: Path,
+    prompt_mode: str,
+    cycle: int = 0,
+    headless: bool = False,
+) -> None:
     try:
         prompt_content, source = resolve_prompt_content(workdir, prompt_filename, prompt_mode)
     except FileNotFoundError as exc:
@@ -175,8 +194,9 @@ def run_agent(role: str, prompt_filename: str, workdir: Path, prompt_mode: str, 
         print(f"❌ 读取提示词失败: {exc}")
         raise SystemExit(1)
 
+    execution_mode = "headless" if headless else "interactive"
     print(f"\n[🚀] 正在唤醒 {role}... (提示词来源: {source})")
-    command = ["codex", "--full-auto", prompt_content]
+    command = ["codex", "exec", "--full-auto", prompt_content] if headless else ["codex", "--full-auto", prompt_content]
     start_time = _iso_utc_now()
     end_time = start_time
     return_code = 1
@@ -186,15 +206,21 @@ def run_agent(role: str, prompt_filename: str, workdir: Path, prompt_mode: str, 
     try:
         append_event(workdir, cycle=cycle, event_type="role_start", role=role)
         role_started = True
-        completed = subprocess.run(command, check=False, cwd=workdir, capture_output=True, text=True)
+        if headless:
+            completed = subprocess.run(command, check=False, cwd=workdir, capture_output=True, text=True)
+            stdout_text = completed.stdout or ""
+            stderr_text = completed.stderr or ""
+            if stdout_text:
+                print(stdout_text, end="" if stdout_text.endswith("\n") else "\n")
+            if stderr_text:
+                print(stderr_text, end="" if stderr_text.endswith("\n") else "\n")
+        else:
+            completed = subprocess.run(command, check=False, cwd=workdir)
+            # 交互模式输出已实时流向终端，不做二次捕获。
+            stdout_text = "[streamed_to_terminal]"
+            stderr_text = "[streamed_to_terminal]"
         end_time = _iso_utc_now()
         return_code = completed.returncode
-        stdout_text = completed.stdout or ""
-        stderr_text = completed.stderr or ""
-        if stdout_text:
-            print(stdout_text, end="" if stdout_text.endswith("\n") else "\n")
-        if stderr_text:
-            print(stderr_text, end="" if stderr_text.endswith("\n") else "\n")
         if completed.returncode != 0:
             print(f"[❌] {role} 异常退出 (RC={completed.returncode})，请检查日志。")
             raise SystemExit(1)
@@ -222,6 +248,7 @@ def run_agent(role: str, prompt_filename: str, workdir: Path, prompt_mode: str, 
             return_code=return_code,
             stdout=stdout_text,
             stderr=stderr_text,
+            execution_mode=execution_mode,
         )
         if role_started:
             append_event(workdir, cycle=cycle, event_type="role_end", role=role, return_code=return_code)
@@ -267,6 +294,7 @@ def ensure_runtime_layout(workdir: Path) -> None:
     runtime_dir = ensure_runtime_dir(workdir)
     (runtime_dir / TASKS_DIR).mkdir(parents=True, exist_ok=True)
     (runtime_dir / LOGS_DIR).mkdir(parents=True, exist_ok=True)
+    ensure_control_schema(workdir)
 
 
 def _project_path(workdir: Path) -> Path:
@@ -297,6 +325,136 @@ def get_tasks_dir(workdir: Path) -> Path:
 
 def get_logs_dir(workdir: Path) -> Path:
     return _runtime_dir(workdir) / LOGS_DIR
+
+
+def get_control_dir(workdir: Path) -> Path:
+    return _runtime_dir(workdir) / CONTROL_DIR
+
+
+def _control_tasks_path(workdir: Path) -> Path:
+    return get_control_dir(workdir) / CONTROL_TASKS_FILE
+
+
+def _scheduler_state_path(workdir: Path) -> Path:
+    return get_control_dir(workdir) / SCHEDULER_STATE_FILE
+
+
+def _default_control_tasks() -> dict[str, Any]:
+    return {
+        "schema_version": CONTROL_SCHEMA_VERSION,
+        "mode": CONTROL_MODE_SERIAL,
+        "tasks": [],
+    }
+
+
+def _default_scheduler_state() -> dict[str, Any]:
+    return {
+        "schema_version": CONTROL_SCHEMA_VERSION,
+        "mode": CONTROL_MODE_SERIAL,
+        "max_parallelism": 1,
+        "inflight_tasks": [],
+        "path_locks": {},
+    }
+
+
+def _is_positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _validate_control_tasks_schema(raw: Any) -> None:
+    if not isinstance(raw, dict):
+        raise ValueError("根节点必须是 JSON 对象")
+
+    schema_version = raw.get("schema_version")
+    if not _is_positive_int(schema_version):
+        raise ValueError(f"`schema_version` 必须是正整数，当前值={schema_version!r}")
+
+    mode = raw.get("mode")
+    if mode != CONTROL_MODE_SERIAL:
+        raise ValueError(f"`mode` 必须为 {CONTROL_MODE_SERIAL!r}，当前值={mode!r}")
+
+    tasks = raw.get("tasks")
+    if not isinstance(tasks, list):
+        raise ValueError(f"`tasks` 必须是数组，当前值={tasks!r}")
+
+
+def _validate_scheduler_state_schema(raw: Any) -> None:
+    if not isinstance(raw, dict):
+        raise ValueError("根节点必须是 JSON 对象")
+
+    schema_version = raw.get("schema_version")
+    if not _is_positive_int(schema_version):
+        raise ValueError(f"`schema_version` 必须是正整数，当前值={schema_version!r}")
+
+    mode = raw.get("mode")
+    if mode != CONTROL_MODE_SERIAL:
+        raise ValueError(f"`mode` 必须为 {CONTROL_MODE_SERIAL!r}，当前值={mode!r}")
+
+    max_parallelism = raw.get("max_parallelism")
+    if isinstance(max_parallelism, bool) or not isinstance(max_parallelism, int) or max_parallelism != 1:
+        raise ValueError(f"`max_parallelism` 在串行模式下必须为 1，当前值={max_parallelism!r}")
+
+    inflight_tasks = raw.get("inflight_tasks")
+    if not isinstance(inflight_tasks, list):
+        raise ValueError(f"`inflight_tasks` 必须是数组，当前值={inflight_tasks!r}")
+
+    path_locks = raw.get("path_locks")
+    if not isinstance(path_locks, dict):
+        raise ValueError(f"`path_locks` 必须是对象，当前值={path_locks!r}")
+
+
+def _write_control_file(path: Path, payload: dict[str, Any]) -> None:
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    content = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    try:
+        tmp_path.write_text(content, encoding="utf-8")
+        tmp_path.replace(path)
+    except OSError as exc:
+        print(f"❌ 控制面文件写入失败（{path.name}）: {exc}")
+        raise SystemExit(1)
+
+
+def _read_control_file(path: Path) -> Any:
+    try:
+        content = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        print(f"❌ 控制面文件读取失败（{path.name}）: {exc}")
+        raise SystemExit(1)
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError as exc:
+        print(f"❌ 控制面文件 JSON 非法（{path.name}）: {exc}")
+        raise SystemExit(1)
+
+
+def _validate_control_file(path: Path, validator: Any) -> None:
+    raw = _read_control_file(path)
+    try:
+        validator(raw)
+    except ValueError as exc:
+        print(f"❌ 控制面文件契约校验失败（{path.name}）: {exc}")
+        raise SystemExit(1)
+
+
+def ensure_control_schema(workdir: Path) -> None:
+    control_dir = get_control_dir(workdir)
+    try:
+        control_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(f"❌ 控制面目录创建失败（{control_dir}）: {exc}")
+        raise SystemExit(1)
+
+    tasks_path = _control_tasks_path(workdir)
+    if tasks_path.exists():
+        _validate_control_file(tasks_path, _validate_control_tasks_schema)
+    else:
+        _write_control_file(tasks_path, _default_control_tasks())
+
+    scheduler_state_path = _scheduler_state_path(workdir)
+    if scheduler_state_path.exists():
+        _validate_control_file(scheduler_state_path, _validate_scheduler_state_schema)
+    else:
+        _write_control_file(scheduler_state_path, _default_scheduler_state())
 
 
 def task_file_path(workdir: Path, task_name: str) -> Path:
@@ -450,8 +608,19 @@ def codex_available() -> bool:
     return shutil.which("codex") is not None
 
 
+def _build_state(cycle: int, next_step: str) -> dict[str, Any]:
+    return {
+        "cycle": cycle,
+        "next_step": next_step,
+        "inflight_role": None,
+        "run_id": None,
+        "started_at": None,
+        "attempt": 0,
+    }
+
+
 def _default_state() -> dict[str, Any]:
-    return {"cycle": 1, "next_step": "supervisor"}
+    return _build_state(cycle=1, next_step="supervisor")
 
 
 def _state_path(workdir: Path) -> Path:
@@ -462,12 +631,109 @@ def _legacy_state_path(workdir: Path) -> Path:
     return workdir / LEGACY_STATE_FILE
 
 
-def _normalize_state(raw: dict[str, Any]) -> dict[str, Any] | None:
-    cycle = raw.get("cycle")
-    next_step = raw.get("next_step")
-    if isinstance(cycle, int) and cycle > 0 and next_step in ROLE_ORDER:
-        return {"cycle": cycle, "next_step": next_step}
-    return None
+def _normalize_attempt(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int) and value >= 0:
+        return value
+    return 0
+
+
+def _normalize_state(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ValueError("状态根节点必须是 JSON 对象")
+
+    errors: list[str] = []
+
+    cycle_raw = raw.get("cycle")
+    if isinstance(cycle_raw, bool) or not isinstance(cycle_raw, int) or cycle_raw <= 0:
+        errors.append(f"`cycle` 必须是正整数，当前值={cycle_raw!r}")
+        cycle = 1
+    else:
+        cycle = cycle_raw
+
+    next_step_raw = raw.get("next_step")
+    if not isinstance(next_step_raw, str) or next_step_raw not in ROLE_ORDER:
+        errors.append(f"`next_step` 非法，必须为 {ROLE_ORDER} 之一，当前值={next_step_raw!r}")
+        next_step = "supervisor"
+    else:
+        next_step = next_step_raw
+
+    if "inflight_role" not in raw:
+        inflight_role = None
+    else:
+        inflight_raw = raw.get("inflight_role")
+        if inflight_raw is None:
+            inflight_role = None
+        elif isinstance(inflight_raw, str) and inflight_raw in ROLE_ORDER:
+            inflight_role = inflight_raw
+        else:
+            errors.append(f"`inflight_role` 非法，必须为 null 或 {ROLE_ORDER} 之一，当前值={inflight_raw!r}")
+            inflight_role = None
+
+    if "run_id" not in raw:
+        run_id = None
+    else:
+        run_id_raw = raw.get("run_id")
+        if run_id_raw is None:
+            run_id = None
+        elif isinstance(run_id_raw, str) and run_id_raw.strip():
+            run_id = run_id_raw
+        else:
+            errors.append(f"`run_id` 非法，必须为非空字符串或 null，当前值={run_id_raw!r}")
+            run_id = None
+
+    if "started_at" not in raw:
+        started_at = None
+    else:
+        started_at_raw = raw.get("started_at")
+        if started_at_raw is None:
+            started_at = None
+        elif isinstance(started_at_raw, str) and started_at_raw.strip():
+            started_at = started_at_raw
+        else:
+            errors.append(f"`started_at` 非法，必须为非空字符串或 null，当前值={started_at_raw!r}")
+            started_at = None
+
+    if "attempt" not in raw:
+        attempt = 0
+    else:
+        attempt_raw = raw.get("attempt")
+        if isinstance(attempt_raw, bool) or not isinstance(attempt_raw, int) or attempt_raw < 0:
+            errors.append(f"`attempt` 非法，必须为 >= 0 的整数，当前值={attempt_raw!r}")
+            attempt = 0
+        else:
+            attempt = attempt_raw
+
+    if not errors:
+        if inflight_role is None:
+            if run_id is not None:
+                errors.append("`inflight_role` 为 null 时，`run_id` 必须为 null")
+            if started_at is not None:
+                errors.append("`inflight_role` 为 null 时，`started_at` 必须为 null")
+            if attempt != 0:
+                errors.append("`inflight_role` 为 null 时，`attempt` 必须为 0")
+        else:
+            if run_id is None:
+                errors.append("`inflight_role` 非 null 时，`run_id` 不能为空")
+            if started_at is None:
+                errors.append("`inflight_role` 非 null 时，`started_at` 不能为空")
+            if attempt <= 0:
+                errors.append("`inflight_role` 非 null 时，`attempt` 必须 >= 1")
+            if next_step != inflight_role:
+                errors.append("在途状态不一致：`next_step` 必须与 `inflight_role` 一致")
+
+    if errors:
+        raise ValueError("; ".join(errors))
+
+    return {
+        "cycle": cycle,
+        "next_step": next_step,
+        "inflight_role": inflight_role,
+        "run_id": run_id,
+        "started_at": started_at,
+        "attempt": attempt,
+    }
 
 
 def save_state(workdir: Path, state: dict[str, Any]) -> None:
@@ -497,16 +763,82 @@ def infer_state_from_task(workdir: Path) -> dict[str, Any]:
 
     if worker_pos == -1 and validator_pos == -1:
         if "## Worker 反馈区" in text or "@Worker" in text:
-            return {"cycle": cycle, "next_step": "human_gate"}
+            return _build_state(cycle=cycle, next_step="human_gate")
         return _default_state()
     if worker_pos > validator_pos:
-        return {"cycle": cycle, "next_step": "validator"}
+        return _build_state(cycle=cycle, next_step="validator")
     if validator_pos > worker_pos:
-        return {"cycle": cycle, "next_step": "supervisor"}
+        return _build_state(cycle=cycle, next_step="supervisor")
     return _default_state()
 
 
+def _state_needs_backfill(raw: dict[str, Any], normalized: dict[str, Any]) -> bool:
+    return any(key not in raw or raw.get(key) != normalized[key] for key in normalized)
+
+
+def _infer_state_from_events(workdir: Path) -> dict[str, Any] | None:
+    event_path = get_events_path(workdir)
+    if not event_path.exists():
+        return None
+
+    try:
+        lines = event_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+
+    for raw_line in reversed(lines):
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+
+        cycle = payload.get("cycle")
+        if isinstance(cycle, bool) or not isinstance(cycle, int) or cycle <= 0:
+            continue
+
+        event_type = str(payload.get("event_type", "")).strip().lower()
+        if event_type == "cycle_end":
+            return _build_state(cycle=cycle + 1, next_step="supervisor")
+        if event_type == "cycle_start":
+            return _build_state(cycle=cycle, next_step="supervisor")
+        if event_type not in {"role_start", "role_end"}:
+            continue
+
+        role = str(payload.get("role", "")).strip().lower()
+        if role not in TRANSACTIONAL_ROLES:
+            continue
+
+        if event_type == "role_start":
+            recovered = _build_state(cycle=cycle, next_step=role)
+            recovered["inflight_role"] = role
+            recovered["run_id"] = f"{cycle}-{role}-recovered"
+            timestamp = payload.get("timestamp")
+            recovered["started_at"] = timestamp if isinstance(timestamp, str) and timestamp.strip() else _iso_utc_now()
+            recovered["attempt"] = 1
+            return recovered
+
+        return_code = payload.get("return_code")
+        if isinstance(return_code, bool) or not isinstance(return_code, int):
+            continue
+        if return_code == 0:
+            if role == "supervisor":
+                return _build_state(cycle=cycle, next_step="human_gate")
+            if role == "worker":
+                return _build_state(cycle=cycle, next_step="validator")
+            if role == "validator":
+                return _build_state(cycle=cycle + 1, next_step="supervisor")
+        return _build_state(cycle=cycle, next_step=role)
+
+    return None
+
+
 def load_state(workdir: Path) -> dict[str, Any]:
+    ensure_control_schema(workdir)
     path = _state_path(workdir)
     legacy_path = _legacy_state_path(workdir)
 
@@ -515,17 +847,27 @@ def load_state(workdir: Path) -> dict[str, Any]:
             continue
         try:
             raw = json.loads(candidate.read_text(encoding="utf-8"))
+        except OSError as exc:
+            print(f"❌ 状态文件读取失败（{candidate.name}）: {exc}")
+            raise SystemExit(1)
+        except json.JSONDecodeError as exc:
+            print(f"❌ 状态文件 JSON 非法（{candidate.name}）: {exc}")
+            raise SystemExit(1)
+        try:
             state = _normalize_state(raw)
-        except (OSError, json.JSONDecodeError):
-            print(f"⚠️ 状态文件读取失败，自动改为 TASK 推断：{candidate.name}")
-            continue
-        if state is None:
-            print(f"⚠️ 状态文件格式异常，自动改为 TASK 推断：{candidate.name}")
-            continue
-        if candidate == legacy_path:
+        except ValueError as exc:
+            print(f"❌ 状态文件契约校验失败（{candidate.name}）: {exc}")
+            raise SystemExit(1)
+        if candidate == legacy_path or _state_needs_backfill(raw, state):
             save_state(workdir, state)
+        if candidate == legacy_path:
             print(f"ℹ️ 已迁移旧状态文件到 {_state_path(workdir)}")
         return state
+
+    inferred_from_events = _infer_state_from_events(workdir)
+    if inferred_from_events is not None:
+        save_state(workdir, inferred_from_events)
+        return inferred_from_events
 
     inferred = infer_state_from_task(workdir)
     save_state(workdir, inferred)
@@ -581,6 +923,150 @@ def sync_task_bus_to_active(workdir: Path, active_task: str) -> None:
     target.write_text(bus.read_text(encoding="utf-8"), encoding="utf-8")
 
 
+def _normalize_role_token(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip().lower()
+
+
+def _coerce_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    return None
+
+
+def append_task_completion_evidence(workdir: Path, cycle: int, role: str, run_id: str) -> None:
+    role_token = _normalize_role_token(role)
+    run_token = run_id.strip() if isinstance(run_id, str) else ""
+    if not role_token or not run_token:
+        print(f"❌ TASK 完成证据参数非法: cycle={cycle}, role={role}, run_id={run_id}")
+        raise SystemExit(1)
+
+    task_path = workdir / "TASK.md"
+    if not task_path.exists():
+        print("❌ 缺少 TASK.md，无法写入角色完成证据。")
+        raise SystemExit(1)
+
+    payload = {
+        "cycle": int(cycle),
+        "role": role_token,
+        "run_id": run_token,
+        "status": "completed",
+    }
+    line = f"{TASK_COMPLETION_EVIDENCE_PREFIX}{json.dumps(payload, ensure_ascii=False, sort_keys=True)}\n"
+    try:
+        with task_path.open("a", encoding="utf-8") as handle:
+            handle.write(line)
+    except OSError as exc:
+        print(f"❌ 写入 TASK.md 完成证据失败: {exc}")
+        raise SystemExit(1)
+
+
+def _task_has_completion_evidence(workdir: Path, cycle: int, role: str, run_id: str) -> bool:
+    task_path = workdir / "TASK.md"
+    if not task_path.exists():
+        return False
+
+    target_role = _normalize_role_token(role)
+    target_run = run_id.strip()
+    target_cycle = int(cycle)
+    try:
+        lines = task_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+
+    for raw_line in reversed(lines):
+        line = raw_line.strip()
+        if not line.startswith(TASK_COMPLETION_EVIDENCE_PREFIX):
+            continue
+        payload_text = line[len(TASK_COMPLETION_EVIDENCE_PREFIX) :].strip()
+        try:
+            payload = json.loads(payload_text)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if _coerce_int(payload.get("cycle")) != target_cycle:
+            continue
+        if _normalize_role_token(payload.get("role")) != target_role:
+            continue
+        if str(payload.get("run_id", "")).strip() != target_run:
+            continue
+        if str(payload.get("status", "")).strip().lower() != "completed":
+            continue
+        return True
+    return False
+
+
+def _has_successful_role_end_event(workdir: Path, cycle: int, role: str) -> bool:
+    event_path = get_events_path(workdir)
+    if not event_path.exists():
+        return False
+
+    target_cycle = int(cycle)
+    target_role = _normalize_role_token(role)
+    try:
+        lines = event_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+
+    for raw_line in reversed(lines):
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        event_type = str(payload.get("event_type", "")).strip().lower()
+        if event_type not in {"role_start", "role_end"}:
+            continue
+        if _coerce_int(payload.get("cycle")) != target_cycle:
+            continue
+        if _normalize_role_token(payload.get("role")) != target_role:
+            continue
+        if event_type != "role_end":
+            return False
+        return _coerce_int(payload.get("return_code")) == 0
+    return False
+
+
+def _verify_role_dual_gate(workdir: Path, cycle: int, role: str, run_id: str) -> list[str]:
+    failures: list[str] = []
+    if not _has_successful_role_end_event(workdir, cycle=cycle, role=role):
+        failures.append(f"闸门A失败：缺少 cycle={cycle}, role={role} 的 role_end(return_code=0) 证据")
+    if not _task_has_completion_evidence(workdir, cycle=cycle, role=role, run_id=run_id):
+        failures.append(
+            "闸门B失败：TASK.md 缺少 "
+            f"cycle={cycle}, role={role}, run_id={run_id}, status=completed 证据"
+        )
+    return failures
+
+
+def _fail_dual_gate_and_stop(
+    workdir: Path,
+    state: dict[str, Any],
+    cycle: int,
+    role: str,
+    run_id: str,
+    active_task: str,
+    failures: list[str],
+) -> None:
+    _clear_role_transaction(state)
+    state["cycle"] = cycle
+    state["next_step"] = role
+    save_state(workdir, state)
+    sync_task_bus_to_active(workdir, active_task)
+    print(f"❌ 双闸门校验失败，已阻断推进: cycle={cycle}, role={role}, run_id={run_id}")
+    for reason in failures:
+        print(f"   - {reason}")
+    raise SystemExit(1)
+
+
 def list_tasks(workdir: Path) -> list[str]:
     tasks_dir = get_tasks_dir(workdir)
     if not tasks_dir.exists():
@@ -622,18 +1108,79 @@ def _resolve_start_step(state: dict[str, Any], start_step: str | None) -> dict[s
     return state
 
 
+def _apply_success_transition_from_recovered_role(workdir: Path, state: dict[str, Any], role: str, cycle: int) -> None:
+    _clear_role_transaction(state)
+    if role == "supervisor":
+        state["next_step"] = "human_gate"
+        return
+    if role == "worker":
+        state["next_step"] = "validator"
+        return
+    if role == "validator":
+        append_event(workdir, cycle=cycle, event_type="cycle_end")
+        state["cycle"] = cycle + 1
+        state["next_step"] = "supervisor"
+        return
+    state["next_step"] = role
+
+
+def _recover_inflight_role_state(workdir: Path, state: dict[str, Any]) -> dict[str, Any]:
+    inflight_role = state.get("inflight_role")
+    if not isinstance(inflight_role, str) or inflight_role not in TRANSACTIONAL_ROLES:
+        return state
+
+    cycle = int(state["cycle"])
+    run_id = str(state.get("run_id") or "")
+
+    if not _has_successful_role_end_event(workdir, cycle=cycle, role=inflight_role):
+        state["next_step"] = inflight_role
+        return state
+
+    gate_failures = _verify_role_dual_gate(workdir, cycle=cycle, role=inflight_role, run_id=run_id)
+    if gate_failures:
+        state["next_step"] = inflight_role
+        return state
+
+    _apply_success_transition_from_recovered_role(workdir, state, inflight_role, cycle)
+    return state
+
+
+def _start_role_transaction(state: dict[str, Any], role: str, cycle: int) -> None:
+    previous_attempt = _normalize_attempt(state.get("attempt"))
+    if state.get("inflight_role") == role and state.get("cycle") == cycle:
+        attempt = previous_attempt + 1
+    else:
+        attempt = 1
+    state["inflight_role"] = role
+    state["run_id"] = f"{cycle}-{role}-a{attempt}-{uuid.uuid4().hex[:12]}"
+    state["started_at"] = _iso_utc_now()
+    state["attempt"] = attempt
+
+
+def _clear_role_transaction(state: dict[str, Any]) -> None:
+    state["inflight_role"] = None
+    state["run_id"] = None
+    state["started_at"] = None
+    state["attempt"] = 0
+
+
 def _ensure_supervisor_bootstrap(workdir: Path, state: dict[str, Any]) -> dict[str, Any]:
     if (workdir / "TASK.md").exists():
         return state
     if state.get("next_step") != "supervisor" or state.get("cycle") != 1:
         print("ℹ️ 检测到 TASK.md 缺失，已强制从 Supervisor 开始首轮建模。")
-    return {"cycle": 1, "next_step": "supervisor"}
+    return _default_state()
+
+
+def has_interactive_tty() -> bool:
+    return bool(sys.stdin.isatty() and sys.stdout.isatty())
 
 
 def run_workflow(
     workdir: Path | None = None,
     start_step: str | None = None,
     allow_repo_root: bool = False,
+    headless: bool = False,
 ) -> None:
     base = (workdir or Path.cwd()).resolve()
 
@@ -645,8 +1192,16 @@ def run_workflow(
     active_task, _ = ensure_active_task_file(base, project_config)
     prompt_mode = str(project_config.get("prompt_mode", PROMPT_MODE_GLOBAL))
     validate_prompt_mode_env(base, prompt_mode)
+    if not headless and not has_interactive_tty():
+        print("❌ 当前会话不是交互终端（TTY），默认模式无法运行。")
+        print("👉 请在真实终端运行 `centaur run`，或显式使用 `centaur run --headless`。")
+        raise SystemExit(1)
+    if headless:
+        print("ℹ️ 已启用 headless 模式：将使用 `codex exec` 非交互执行。")
     state = load_state(base)
     state = _resolve_start_step(state, start_step)
+    if start_step is None:
+        state = _recover_inflight_role_state(base, state)
     state = _ensure_supervisor_bootstrap(base, state)
     save_state(base, state)
     sync_task_bus_to_active(base, active_task)
@@ -667,7 +1222,23 @@ def run_workflow(
         print("█" * 60)
 
         if next_step == "supervisor":
-            run_agent("Supervisor", "SUPERVISOR.md", base, prompt_mode, cycle=cycle)
+            _start_role_transaction(state, role="supervisor", cycle=cycle)
+            save_state(base, state)
+            run_id = str(state.get("run_id") or "")
+            run_agent("Supervisor", "SUPERVISOR.md", base, prompt_mode, cycle=cycle, headless=headless)
+            append_task_completion_evidence(base, cycle=cycle, role="supervisor", run_id=run_id)
+            gate_failures = _verify_role_dual_gate(base, cycle=cycle, role="supervisor", run_id=run_id)
+            if gate_failures:
+                _fail_dual_gate_and_stop(
+                    workdir=base,
+                    state=state,
+                    cycle=cycle,
+                    role="supervisor",
+                    run_id=run_id,
+                    active_task=active_task,
+                    failures=gate_failures,
+                )
+            _clear_role_transaction(state)
             state["next_step"] = "human_gate"
             save_state(base, state)
             sync_task_bus_to_active(base, active_task)
@@ -681,14 +1252,46 @@ def run_workflow(
             continue
 
         if next_step == "worker":
-            run_agent("Worker", "WORKER.md", base, prompt_mode, cycle=cycle)
+            _start_role_transaction(state, role="worker", cycle=cycle)
+            save_state(base, state)
+            run_id = str(state.get("run_id") or "")
+            run_agent("Worker", "WORKER.md", base, prompt_mode, cycle=cycle, headless=headless)
+            append_task_completion_evidence(base, cycle=cycle, role="worker", run_id=run_id)
+            gate_failures = _verify_role_dual_gate(base, cycle=cycle, role="worker", run_id=run_id)
+            if gate_failures:
+                _fail_dual_gate_and_stop(
+                    workdir=base,
+                    state=state,
+                    cycle=cycle,
+                    role="worker",
+                    run_id=run_id,
+                    active_task=active_task,
+                    failures=gate_failures,
+                )
+            _clear_role_transaction(state)
             state["next_step"] = "validator"
             save_state(base, state)
             sync_task_bus_to_active(base, active_task)
             continue
 
         print("\n🔍 Validator 正在审查 Worker 的代码与数据契约...")
-        run_agent("Validator", "VALIDATOR.md", base, prompt_mode, cycle=cycle)
+        _start_role_transaction(state, role="validator", cycle=cycle)
+        save_state(base, state)
+        run_id = str(state.get("run_id") or "")
+        run_agent("Validator", "VALIDATOR.md", base, prompt_mode, cycle=cycle, headless=headless)
+        append_task_completion_evidence(base, cycle=cycle, role="validator", run_id=run_id)
+        gate_failures = _verify_role_dual_gate(base, cycle=cycle, role="validator", run_id=run_id)
+        if gate_failures:
+            _fail_dual_gate_and_stop(
+                workdir=base,
+                state=state,
+                cycle=cycle,
+                role="validator",
+                run_id=run_id,
+                active_task=active_task,
+                failures=gate_failures,
+            )
+        _clear_role_transaction(state)
         append_event(base, cycle=cycle, event_type="cycle_end")
         state["cycle"] = cycle + 1
         state["next_step"] = "supervisor"

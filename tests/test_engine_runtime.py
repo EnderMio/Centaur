@@ -13,11 +13,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from centaur.engine import (  # noqa: E402
+    CONTROL_DIR,
+    CONTROL_TASKS_FILE,
     DEFAULT_TASK_NAME,
     EVENTS_FILE,
     PROJECT_SCHEMA_VERSION,
     RUNTIME_DIR,
+    SCHEDULER_STATE_FILE,
+    TASK_COMPLETION_EVIDENCE_PREFIX,
+    append_event,
     ensure_runtime_layout,
+    load_state,
     load_or_init_project_config,
     migrate_schema,
     run_agent,
@@ -93,25 +99,720 @@ class EngineRuntimeTests(unittest.TestCase):
         self.assertFalse(validate_task_name(""))
         self.assertFalse(validate_task_name("!invalid"))
 
+    def test_control_schema_files_created_with_minimum_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            ensure_runtime_layout(workspace)
+
+            tasks_path = workspace / RUNTIME_DIR / CONTROL_DIR / CONTROL_TASKS_FILE
+            scheduler_path = workspace / RUNTIME_DIR / CONTROL_DIR / SCHEDULER_STATE_FILE
+            self.assertTrue(tasks_path.exists())
+            self.assertTrue(scheduler_path.exists())
+            self.assertEqual(
+                json.loads(tasks_path.read_text(encoding="utf-8")),
+                {"schema_version": 1, "mode": "serial", "tasks": []},
+            )
+            self.assertEqual(
+                json.loads(scheduler_path.read_text(encoding="utf-8")),
+                {
+                    "schema_version": 1,
+                    "mode": "serial",
+                    "max_parallelism": 1,
+                    "inflight_tasks": [],
+                    "path_locks": {},
+                },
+            )
+
+    def test_control_schema_does_not_rewrite_existing_valid_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            control_dir = workspace / RUNTIME_DIR / CONTROL_DIR
+            control_dir.mkdir(parents=True, exist_ok=True)
+
+            tasks_path = control_dir / CONTROL_TASKS_FILE
+            scheduler_path = control_dir / SCHEDULER_STATE_FILE
+            tasks_content = (
+                json.dumps(
+                    {"schema_version": 1, "mode": "serial", "tasks": [{"id": "t-1"}]},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n"
+            )
+            scheduler_content = (
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "mode": "serial",
+                        "max_parallelism": 1,
+                        "inflight_tasks": ["t-1"],
+                        "path_locks": {"/tmp/path": "t-1"},
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n"
+            )
+            tasks_path.write_text(tasks_content, encoding="utf-8")
+            scheduler_path.write_text(scheduler_content, encoding="utf-8")
+
+            ensure_runtime_layout(workspace)
+
+            self.assertEqual(tasks_path.read_text(encoding="utf-8"), tasks_content)
+            self.assertEqual(scheduler_path.read_text(encoding="utf-8"), scheduler_content)
+
+    def test_control_schema_fail_fast_on_invalid_json_or_contract(self) -> None:
+        invalid_cases = (
+            ("tasks_invalid_json", CONTROL_TASKS_FILE, "{invalid-json", "控制面文件 JSON 非法"),
+            (
+                "scheduler_invalid_field",
+                SCHEDULER_STATE_FILE,
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "mode": "serial",
+                        "max_parallelism": "1",
+                        "inflight_tasks": [],
+                        "path_locks": {},
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                "控制面文件契约校验失败",
+            ),
+        )
+
+        for case_name, target_file, payload, marker in invalid_cases:
+            with self.subTest(case=case_name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    workspace = Path(tmp)
+                    control_dir = workspace / RUNTIME_DIR / CONTROL_DIR
+                    control_dir.mkdir(parents=True, exist_ok=True)
+
+                    tasks_path = control_dir / CONTROL_TASKS_FILE
+                    scheduler_path = control_dir / SCHEDULER_STATE_FILE
+                    if target_file != CONTROL_TASKS_FILE:
+                        tasks_path.write_text(
+                            json.dumps({"schema_version": 1, "mode": "serial", "tasks": []}, ensure_ascii=False, indent=2)
+                            + "\n",
+                            encoding="utf-8",
+                        )
+                    if target_file != SCHEDULER_STATE_FILE:
+                        scheduler_path.write_text(
+                            json.dumps(
+                                {
+                                    "schema_version": 1,
+                                    "mode": "serial",
+                                    "max_parallelism": 1,
+                                    "inflight_tasks": [],
+                                    "path_locks": {},
+                                },
+                                ensure_ascii=False,
+                                indent=2,
+                            )
+                            + "\n",
+                            encoding="utf-8",
+                        )
+
+                    target_path = control_dir / target_file
+                    target_path.write_text(payload, encoding="utf-8")
+
+                    output_buffer = io.StringIO()
+                    with redirect_stdout(output_buffer):
+                        with self.assertRaises(SystemExit) as cm:
+                            ensure_runtime_layout(workspace)
+                    output = output_buffer.getvalue()
+
+                    self.assertEqual(cm.exception.code, 1)
+                    self.assertIn(marker, output)
+                    self.assertEqual(target_path.read_text(encoding="utf-8"), payload)
+
+    def test_load_state_backfills_transaction_fields_for_old_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            ensure_runtime_layout(workspace)
+            state_path = workspace / RUNTIME_DIR / "state.json"
+            state_path.write_text(json.dumps({"cycle": 2, "next_step": "worker"}), encoding="utf-8")
+
+            state = load_state(workspace)
+            self.assertEqual(state["cycle"], 2)
+            self.assertEqual(state["next_step"], "worker")
+            self.assertIsNone(state["inflight_role"])
+            self.assertIsNone(state["run_id"])
+            self.assertIsNone(state["started_at"])
+            self.assertEqual(state["attempt"], 0)
+
+            persisted = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertIn("inflight_role", persisted)
+            self.assertIn("run_id", persisted)
+            self.assertIn("started_at", persisted)
+            self.assertIn("attempt", persisted)
+            self.assertIsNone(persisted["inflight_role"])
+            self.assertIsNone(persisted["run_id"])
+            self.assertIsNone(persisted["started_at"])
+            self.assertEqual(persisted["attempt"], 0)
+
+    def test_load_state_fail_fast_on_invalid_state_contract(self) -> None:
+        invalid_cases = (
+            (
+                "invalid_next_step",
+                {
+                    "cycle": 2,
+                    "next_step": "oops",
+                },
+                "`next_step`",
+            ),
+            (
+                "invalid_inflight_role",
+                {
+                    "cycle": 2,
+                    "next_step": "worker",
+                    "inflight_role": "oops",
+                    "run_id": "run-1",
+                    "started_at": "2026-03-05T00:00:00+00:00",
+                    "attempt": 1,
+                },
+                "`inflight_role`",
+            ),
+            (
+                "inflight_fields_mismatch",
+                {
+                    "cycle": 2,
+                    "next_step": "validator",
+                    "inflight_role": "worker",
+                    "run_id": "run-1",
+                    "started_at": "2026-03-05T00:00:00+00:00",
+                    "attempt": 1,
+                },
+                "在途状态不一致",
+            ),
+            (
+                "invalid_attempt_type",
+                {
+                    "cycle": 2,
+                    "next_step": "worker",
+                    "inflight_role": "worker",
+                    "run_id": "run-1",
+                    "started_at": "2026-03-05T00:00:00+00:00",
+                    "attempt": "1",
+                },
+                "`attempt`",
+            ),
+        )
+        for case_name, payload, marker in invalid_cases:
+            with self.subTest(case=case_name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    workspace = Path(tmp)
+                    ensure_runtime_layout(workspace)
+                    state_path = workspace / RUNTIME_DIR / "state.json"
+                    state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+                    output_buffer = io.StringIO()
+                    with redirect_stdout(output_buffer):
+                        with self.assertRaises(SystemExit) as cm:
+                            load_state(workspace)
+                    output = output_buffer.getvalue()
+
+                    self.assertEqual(cm.exception.code, 1)
+                    self.assertIn("状态文件契约校验失败", output)
+                    self.assertIn(marker, output)
+                    self.assertEqual(json.loads(state_path.read_text(encoding="utf-8")), payload)
+
+    def test_sh_2_13_load_state_prefers_structured_evidence_over_task_inference(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            ensure_runtime_layout(workspace)
+            (workspace / "TASK.md").write_text(
+                "# 当前任务 (Task)\n\n### Validator 审查报告\n- 状态: `[成功]`\n",
+                encoding="utf-8",
+            )
+            append_event(workspace, cycle=4, event_type="role_start", role="worker")
+            append_event(workspace, cycle=4, event_type="role_end", role="worker", return_code=0)
+
+            state = load_state(workspace)
+
+            self.assertEqual(state["cycle"], 4)
+            self.assertEqual(state["next_step"], "validator")
+            self.assertIsNone(state["inflight_role"])
+            self.assertEqual(state["attempt"], 0)
+
+    def test_sh_2_13_load_state_falls_back_to_task_inference_when_structured_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            ensure_runtime_layout(workspace)
+            (workspace / "TASK.md").write_text(
+                "# 当前任务 (Task)\n\n### Worker 执行报告\n- 状态: `[成功]`\n",
+                encoding="utf-8",
+            )
+
+            state = load_state(workspace)
+
+            self.assertEqual(state["cycle"], 1)
+            self.assertEqual(state["next_step"], "validator")
+            self.assertIsNone(state["inflight_role"])
+            self.assertEqual(state["attempt"], 0)
+
+    def test_sh_2_13_load_state_fail_fast_on_invalid_control_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            control_dir = workspace / RUNTIME_DIR / CONTROL_DIR
+            control_dir.mkdir(parents=True, exist_ok=True)
+            tasks_path = control_dir / CONTROL_TASKS_FILE
+            scheduler_path = control_dir / SCHEDULER_STATE_FILE
+            tasks_path.write_text("{invalid-json", encoding="utf-8")
+            scheduler_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "mode": "serial",
+                        "max_parallelism": 1,
+                        "inflight_tasks": [],
+                        "path_locks": {},
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            output_buffer = io.StringIO()
+            with redirect_stdout(output_buffer):
+                with self.assertRaises(SystemExit) as cm:
+                    load_state(workspace)
+            output = output_buffer.getvalue()
+
+            self.assertEqual(cm.exception.code, 1)
+            self.assertIn("控制面文件 JSON 非法", output)
+            self.assertEqual(tasks_path.read_text(encoding="utf-8"), "{invalid-json")
+
+    def test_run_workflow_does_not_advance_when_state_contract_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "PROPOSAL.md").write_text("proposal", encoding="utf-8")
+            (workspace / "TASK.md").write_text("# 当前任务 (Task)\n", encoding="utf-8")
+            load_or_init_project_config(workspace)
+            ensure_runtime_layout(workspace)
+
+            state_path = workspace / RUNTIME_DIR / "state.json"
+            invalid_state = {
+                "cycle": 2,
+                "next_step": "worker",
+                "inflight_role": "worker",
+                "run_id": "run-1",
+                "started_at": "2026-03-05T00:00:00+00:00",
+                "attempt": "1",
+            }
+            state_path.write_text(json.dumps(invalid_state), encoding="utf-8")
+
+            output_buffer = io.StringIO()
+            with patch("centaur.engine.run_agent") as mock_run_agent, redirect_stdout(output_buffer):
+                with self.assertRaises(SystemExit) as cm:
+                    run_workflow(workdir=workspace, headless=True)
+            output = output_buffer.getvalue()
+
+            self.assertEqual(cm.exception.code, 1)
+            mock_run_agent.assert_not_called()
+            self.assertIn("状态文件契约校验失败", output)
+            self.assertIn("`attempt`", output)
+            self.assertEqual(json.loads(state_path.read_text(encoding="utf-8")), invalid_state)
+
+    def test_run_workflow_persists_transaction_fields_before_role_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "PROPOSAL.md").write_text("proposal", encoding="utf-8")
+            (workspace / "TASK.md").write_text("# 当前任务 (Task)\n", encoding="utf-8")
+            load_or_init_project_config(workspace)
+            ensure_runtime_layout(workspace)
+            (workspace / RUNTIME_DIR / "state.json").write_text(
+                json.dumps(
+                    {
+                        "cycle": 3,
+                        "next_step": "validator",
+                        "inflight_role": "validator",
+                        "run_id": "stale-run-id",
+                        "started_at": "2026-03-05T00:00:00+00:00",
+                        "attempt": 2,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            observed: dict[str, object] = {}
+
+            def _fake_run_agent(*_args, **_kwargs) -> None:
+                state = json.loads((workspace / RUNTIME_DIR / "state.json").read_text(encoding="utf-8"))
+                observed.update(state)
+                raise SystemExit(9)
+
+            with patch("centaur.engine.run_agent", side_effect=_fake_run_agent):
+                with self.assertRaises(SystemExit):
+                    run_workflow(workdir=workspace, headless=True)
+
+            self.assertEqual(observed["inflight_role"], "validator")
+            self.assertTrue(observed["run_id"])
+            self.assertTrue(observed["started_at"])
+            self.assertEqual(observed["attempt"], 3)
+
+    def test_run_workflow_replays_inflight_role_after_agent_abrupt_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "PROPOSAL.md").write_text("proposal", encoding="utf-8")
+            (workspace / "TASK.md").write_text("# 当前任务 (Task)\n", encoding="utf-8")
+            load_or_init_project_config(workspace)
+            ensure_runtime_layout(workspace)
+            state_path = workspace / RUNTIME_DIR / "state.json"
+            state_path.write_text(
+                json.dumps({"cycle": 2, "next_step": "worker"}),
+                encoding="utf-8",
+            )
+
+            called_roles: list[str] = []
+            observed: list[dict[str, object]] = []
+
+            def _fake_run_agent(role: str, *_args, **_kwargs) -> None:
+                called_roles.append(role)
+                observed.append(json.loads(state_path.read_text(encoding="utf-8")))
+                if len(called_roles) == 1:
+                    raise SystemExit(2)
+                raise SystemExit(41)
+
+            with patch("centaur.engine.run_agent", side_effect=_fake_run_agent):
+                with self.assertRaises(SystemExit) as first_cm:
+                    run_workflow(workdir=workspace, headless=True)
+                state_after_first = json.loads(state_path.read_text(encoding="utf-8"))
+                with self.assertRaises(SystemExit) as second_cm:
+                    run_workflow(workdir=workspace, headless=True)
+
+            self.assertEqual(first_cm.exception.code, 2)
+            self.assertEqual(second_cm.exception.code, 41)
+            self.assertEqual(called_roles, ["Worker", "Worker"])
+            self.assertEqual(state_after_first["cycle"], 2)
+            self.assertEqual(state_after_first["next_step"], "worker")
+            self.assertEqual(state_after_first["inflight_role"], "worker")
+            self.assertEqual(state_after_first["attempt"], 1)
+            self.assertEqual(observed[1]["cycle"], 2)
+            self.assertEqual(observed[1]["next_step"], "worker")
+            self.assertEqual(observed[1]["inflight_role"], "worker")
+            self.assertEqual(observed[1]["attempt"], 2)
+
+    def test_run_workflow_replays_inflight_role_after_keyboard_interrupt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "PROPOSAL.md").write_text("proposal", encoding="utf-8")
+            (workspace / "TASK.md").write_text("# 当前任务 (Task)\n", encoding="utf-8")
+            load_or_init_project_config(workspace)
+            ensure_runtime_layout(workspace)
+            state_path = workspace / RUNTIME_DIR / "state.json"
+            state_path.write_text(
+                json.dumps({"cycle": 2, "next_step": "worker"}),
+                encoding="utf-8",
+            )
+
+            called_roles: list[str] = []
+            observed: list[dict[str, object]] = []
+
+            def _fake_run_agent(role: str, *_args, **_kwargs) -> None:
+                called_roles.append(role)
+                observed.append(json.loads(state_path.read_text(encoding="utf-8")))
+                if len(called_roles) == 1:
+                    append_event(workspace, cycle=2, event_type="role_end", role="worker", return_code=130)
+                    raise SystemExit(1)
+                raise SystemExit(43)
+
+            with patch("centaur.engine.run_agent", side_effect=_fake_run_agent):
+                with self.assertRaises(SystemExit) as first_cm:
+                    run_workflow(workdir=workspace, headless=True)
+                state_after_first = json.loads(state_path.read_text(encoding="utf-8"))
+                with self.assertRaises(SystemExit) as second_cm:
+                    run_workflow(workdir=workspace, headless=True)
+
+            self.assertEqual(first_cm.exception.code, 1)
+            self.assertEqual(second_cm.exception.code, 43)
+            self.assertEqual(called_roles, ["Worker", "Worker"])
+            self.assertEqual(state_after_first["cycle"], 2)
+            self.assertEqual(state_after_first["next_step"], "worker")
+            self.assertEqual(state_after_first["inflight_role"], "worker")
+            self.assertEqual(state_after_first["attempt"], 1)
+            self.assertEqual(observed[1]["cycle"], 2)
+            self.assertEqual(observed[1]["next_step"], "worker")
+            self.assertEqual(observed[1]["inflight_role"], "worker")
+            self.assertEqual(observed[1]["attempt"], 2)
+
+    def test_run_workflow_replays_inflight_role_when_last_event_not_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "PROPOSAL.md").write_text("proposal", encoding="utf-8")
+            (workspace / "TASK.md").write_text("# 当前任务 (Task)\n", encoding="utf-8")
+            load_or_init_project_config(workspace)
+            ensure_runtime_layout(workspace)
+            (workspace / RUNTIME_DIR / "state.json").write_text(
+                json.dumps(
+                    {
+                        "cycle": 2,
+                        "next_step": "worker",
+                        "inflight_role": "worker",
+                        "run_id": "2-worker-a1-open",
+                        "started_at": "2026-03-05T00:00:00+00:00",
+                        "attempt": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            append_event(workspace, cycle=2, event_type="role_end", role="worker", return_code=0)
+            append_event(workspace, cycle=2, event_type="role_start", role="worker")
+
+            observed: dict[str, object] = {}
+            called_roles: list[str] = []
+
+            def _fake_run_agent(role: str, *_args, **_kwargs) -> None:
+                called_roles.append(role)
+                observed.update(json.loads((workspace / RUNTIME_DIR / "state.json").read_text(encoding="utf-8")))
+                raise SystemExit(19)
+
+            with patch("centaur.engine.run_agent", side_effect=_fake_run_agent):
+                with self.assertRaises(SystemExit) as cm:
+                    run_workflow(workdir=workspace, headless=True)
+
+            self.assertEqual(cm.exception.code, 19)
+            self.assertEqual(called_roles, ["Worker"])
+            self.assertEqual(observed["next_step"], "worker")
+            self.assertEqual(observed["inflight_role"], "worker")
+            self.assertEqual(observed["attempt"], 2)
+
+    def test_run_workflow_does_not_rollback_when_inflight_role_already_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "PROPOSAL.md").write_text("proposal", encoding="utf-8")
+            (workspace / "TASK.md").write_text("# 当前任务 (Task)\n", encoding="utf-8")
+            load_or_init_project_config(workspace)
+            ensure_runtime_layout(workspace)
+
+            run_id = "2-worker-a1-closed"
+            (workspace / RUNTIME_DIR / "state.json").write_text(
+                json.dumps(
+                    {
+                        "cycle": 2,
+                        "next_step": "worker",
+                        "inflight_role": "worker",
+                        "run_id": run_id,
+                        "started_at": "2026-03-05T00:00:00+00:00",
+                        "attempt": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            append_event(workspace, cycle=2, event_type="role_start", role="worker")
+            append_event(workspace, cycle=2, event_type="role_end", role="worker", return_code=0)
+            payload = {"cycle": 2, "role": "worker", "run_id": run_id, "status": "completed"}
+            with (workspace / "TASK.md").open("a", encoding="utf-8") as handle:
+                handle.write(f"{TASK_COMPLETION_EVIDENCE_PREFIX}{json.dumps(payload, ensure_ascii=False, sort_keys=True)}\n")
+
+            observed: dict[str, object] = {}
+            called_roles: list[str] = []
+
+            def _fake_run_agent(role: str, *_args, **_kwargs) -> None:
+                called_roles.append(role)
+                observed.update(json.loads((workspace / RUNTIME_DIR / "state.json").read_text(encoding="utf-8")))
+                raise SystemExit(23)
+
+            with patch("centaur.engine.run_agent", side_effect=_fake_run_agent):
+                with self.assertRaises(SystemExit) as cm:
+                    run_workflow(workdir=workspace, headless=True)
+
+            self.assertEqual(cm.exception.code, 23)
+            self.assertEqual(called_roles, ["Validator"])
+            self.assertEqual(observed["cycle"], 2)
+            self.assertEqual(observed["next_step"], "validator")
+            self.assertEqual(observed["inflight_role"], "validator")
+            self.assertEqual(observed["attempt"], 1)
+
+    def test_run_workflow_does_not_silently_advance_when_inflight_events_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "PROPOSAL.md").write_text("proposal", encoding="utf-8")
+            (workspace / "TASK.md").write_text("# 当前任务 (Task)\n", encoding="utf-8")
+            load_or_init_project_config(workspace)
+            ensure_runtime_layout(workspace)
+
+            run_id = "2-worker-a1-no-events"
+            (workspace / RUNTIME_DIR / "state.json").write_text(
+                json.dumps(
+                    {
+                        "cycle": 2,
+                        "next_step": "worker",
+                        "inflight_role": "worker",
+                        "run_id": run_id,
+                        "started_at": "2026-03-05T00:00:00+00:00",
+                        "attempt": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            payload = {"cycle": 2, "role": "worker", "run_id": run_id, "status": "completed"}
+            with (workspace / "TASK.md").open("a", encoding="utf-8") as handle:
+                handle.write(f"{TASK_COMPLETION_EVIDENCE_PREFIX}{json.dumps(payload, ensure_ascii=False, sort_keys=True)}\n")
+
+            observed: dict[str, object] = {}
+            called_roles: list[str] = []
+
+            def _fake_run_agent(role: str, *_args, **_kwargs) -> None:
+                called_roles.append(role)
+                observed.update(json.loads((workspace / RUNTIME_DIR / "state.json").read_text(encoding="utf-8")))
+                raise SystemExit(29)
+
+            with patch("centaur.engine.run_agent", side_effect=_fake_run_agent):
+                with self.assertRaises(SystemExit) as cm:
+                    run_workflow(workdir=workspace, headless=True)
+
+            self.assertEqual(cm.exception.code, 29)
+            self.assertEqual(called_roles, ["Worker"])
+            self.assertEqual(observed["next_step"], "worker")
+            self.assertEqual(observed["inflight_role"], "worker")
+
+    def test_run_workflow_clears_transaction_fields_after_role_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "PROPOSAL.md").write_text("proposal", encoding="utf-8")
+            (workspace / "TASK.md").write_text("# 当前任务 (Task)\n", encoding="utf-8")
+            load_or_init_project_config(workspace)
+            ensure_runtime_layout(workspace)
+            (workspace / RUNTIME_DIR / "state.json").write_text(
+                json.dumps({"cycle": 2, "next_step": "worker"}),
+                encoding="utf-8",
+            )
+
+            sync_counter = {"value": 0}
+            observed: dict[str, object] = {}
+
+            def _fake_sync_task_bus_to_active(_workdir: Path, _active_task: str) -> None:
+                sync_counter["value"] += 1
+                if sync_counter["value"] == 2:
+                    state = json.loads((workspace / RUNTIME_DIR / "state.json").read_text(encoding="utf-8"))
+                    observed.update(state)
+                    raise SystemExit(11)
+
+            def _fake_run_agent(*_args, **_kwargs) -> None:
+                append_event(workspace, cycle=2, event_type="role_end", role="worker", return_code=0)
+
+            with patch("centaur.engine.run_agent", side_effect=_fake_run_agent), patch(
+                "centaur.engine.sync_task_bus_to_active", side_effect=_fake_sync_task_bus_to_active
+            ):
+                with self.assertRaises(SystemExit):
+                    run_workflow(workdir=workspace, headless=True)
+
+            self.assertEqual(observed["next_step"], "validator")
+            self.assertIsNone(observed["inflight_role"])
+            self.assertIsNone(observed["run_id"])
+            self.assertIsNone(observed["started_at"])
+            self.assertEqual(observed["attempt"], 0)
+
+            evidence_lines = [
+                line
+                for line in (workspace / "TASK.md").read_text(encoding="utf-8").splitlines()
+                if line.startswith(TASK_COMPLETION_EVIDENCE_PREFIX)
+            ]
+            self.assertTrue(evidence_lines)
+            payload = json.loads(evidence_lines[-1][len(TASK_COMPLETION_EVIDENCE_PREFIX) :])
+            self.assertEqual(payload["cycle"], 2)
+            self.assertEqual(payload["role"], "worker")
+            self.assertEqual(payload["status"], "completed")
+            self.assertTrue(payload["run_id"])
+
+    def test_run_workflow_blocks_progress_when_task_run_id_evidence_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "PROPOSAL.md").write_text("proposal", encoding="utf-8")
+            (workspace / "TASK.md").write_text("# 当前任务 (Task)\n", encoding="utf-8")
+            load_or_init_project_config(workspace)
+            ensure_runtime_layout(workspace)
+            (workspace / RUNTIME_DIR / "state.json").write_text(
+                json.dumps({"cycle": 2, "next_step": "worker"}),
+                encoding="utf-8",
+            )
+
+            def _fake_run_agent(*_args, **_kwargs) -> None:
+                append_event(workspace, cycle=2, event_type="role_end", role="worker", return_code=0)
+
+            with patch("centaur.engine.run_agent", side_effect=_fake_run_agent), patch(
+                "centaur.engine.append_task_completion_evidence", return_value=None
+            ):
+                with self.assertRaises(SystemExit) as cm:
+                    run_workflow(workdir=workspace, headless=True)
+
+            self.assertEqual(cm.exception.code, 1)
+            state = json.loads((workspace / RUNTIME_DIR / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["cycle"], 2)
+            self.assertEqual(state["next_step"], "worker")
+            self.assertIsNone(state["inflight_role"])
+            self.assertIsNone(state["run_id"])
+            self.assertIsNone(state["started_at"])
+            self.assertEqual(state["attempt"], 0)
+
+    def test_run_workflow_blocks_progress_when_role_end_gate_fails(self) -> None:
+        for case in ("return_code_nonzero", "missing_role_end"):
+            with self.subTest(case=case):
+                with tempfile.TemporaryDirectory() as tmp:
+                    workspace = Path(tmp)
+                    (workspace / "PROPOSAL.md").write_text("proposal", encoding="utf-8")
+                    (workspace / "TASK.md").write_text("# 当前任务 (Task)\n", encoding="utf-8")
+                    load_or_init_project_config(workspace)
+                    ensure_runtime_layout(workspace)
+                    (workspace / RUNTIME_DIR / "state.json").write_text(
+                        json.dumps({"cycle": 2, "next_step": "worker"}),
+                        encoding="utf-8",
+                    )
+
+                    def _fake_run_agent(*_args, **_kwargs) -> None:
+                        if case == "return_code_nonzero":
+                            append_event(workspace, cycle=2, event_type="role_end", role="worker", return_code=7)
+
+                    with patch("centaur.engine.run_agent", side_effect=_fake_run_agent):
+                        with self.assertRaises(SystemExit) as cm:
+                            run_workflow(workdir=workspace, headless=True)
+
+                    self.assertEqual(cm.exception.code, 1)
+                    state = json.loads((workspace / RUNTIME_DIR / "state.json").read_text(encoding="utf-8"))
+                    self.assertEqual(state["cycle"], 2)
+                    self.assertEqual(state["next_step"], "worker")
+                    self.assertIsNone(state["inflight_role"])
+                    self.assertIsNone(state["run_id"])
+                    self.assertIsNone(state["started_at"])
+                    self.assertEqual(state["attempt"], 0)
+
+                    evidence_lines = [
+                        line
+                        for line in (workspace / "TASK.md").read_text(encoding="utf-8").splitlines()
+                        if line.startswith(TASK_COMPLETION_EVIDENCE_PREFIX)
+                    ]
+                    self.assertTrue(evidence_lines)
+                    payload = json.loads(evidence_lines[-1][len(TASK_COMPLETION_EVIDENCE_PREFIX) :])
+                    self.assertEqual(payload["cycle"], 2)
+                    self.assertEqual(payload["role"], "worker")
+                    self.assertEqual(payload["status"], "completed")
+                    self.assertTrue(payload["run_id"])
+
     @patch("centaur.engine.resolve_prompt_content", return_value=("worker prompt", "测试模板"))
     @patch("centaur.engine.subprocess.run")
     def test_run_agent_log_written_on_success(self, mock_run, _mock_resolve_prompt) -> None:
         mock_run.return_value = subprocess.CompletedProcess(
-            args=["codex", "--full-auto", "worker prompt"],
+            args=["codex", "exec", "--full-auto", "worker prompt"],
             returncode=0,
             stdout="ok\n",
             stderr="",
         )
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
-            run_agent("Worker", "WORKER.md", workspace, "global", cycle=2)
+            run_agent("Worker", "WORKER.md", workspace, "global", cycle=2, headless=True)
             log_path = workspace / ".centaur" / "logs" / "cycle_2_worker.log"
             self.assertTrue(log_path.exists())
             payload = json.loads(log_path.read_text(encoding="utf-8"))
-            self.assertEqual(payload["command"], ["codex", "--full-auto", "worker prompt"])
+            self.assertEqual(payload["command"], ["codex", "exec", "--full-auto", "worker prompt"])
             self.assertTrue(payload["start_time"])
             self.assertTrue(payload["end_time"])
             self.assertEqual(payload["return_code"], 0)
+            self.assertEqual(payload["execution_mode"], "headless")
             self.assertEqual(payload["stdout"], "ok\n")
             self.assertEqual(payload["stderr"], "")
 
@@ -119,7 +820,7 @@ class EngineRuntimeTests(unittest.TestCase):
     @patch("centaur.engine.subprocess.run")
     def test_run_agent_log_written_on_failure(self, mock_run, _mock_resolve_prompt) -> None:
         mock_run.return_value = subprocess.CompletedProcess(
-            args=["codex", "--full-auto", "validator prompt"],
+            args=["codex", "exec", "--full-auto", "validator prompt"],
             returncode=3,
             stdout="partial\n",
             stderr="boom\n",
@@ -127,14 +828,15 @@ class EngineRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
             with self.assertRaises(SystemExit):
-                run_agent("Validator", "VALIDATOR.md", workspace, "global", cycle=4)
+                run_agent("Validator", "VALIDATOR.md", workspace, "global", cycle=4, headless=True)
             log_path = workspace / ".centaur" / "logs" / "cycle_4_validator.log"
             self.assertTrue(log_path.exists())
             payload = json.loads(log_path.read_text(encoding="utf-8"))
-            self.assertEqual(payload["command"], ["codex", "--full-auto", "validator prompt"])
+            self.assertEqual(payload["command"], ["codex", "exec", "--full-auto", "validator prompt"])
             self.assertTrue(payload["start_time"])
             self.assertTrue(payload["end_time"])
             self.assertEqual(payload["return_code"], 3)
+            self.assertEqual(payload["execution_mode"], "headless")
             self.assertEqual(payload["stdout"], "partial\n")
             self.assertEqual(payload["stderr"], "boom\n")
 
@@ -143,13 +845,13 @@ class EngineRuntimeTests(unittest.TestCase):
     def test_event_log_jsonl_append_and_contract(self, mock_run, _mock_resolve_prompt) -> None:
         mock_run.side_effect = [
             subprocess.CompletedProcess(
-                args=["codex", "--full-auto", "role prompt"],
+                args=["codex", "exec", "--full-auto", "role prompt"],
                 returncode=0,
                 stdout="validator-ok\n",
                 stderr="",
             ),
             subprocess.CompletedProcess(
-                args=["codex", "--full-auto", "role prompt"],
+                args=["codex", "exec", "--full-auto", "role prompt"],
                 returncode=2,
                 stdout="supervisor-partial\n",
                 stderr="supervisor-error\n",
@@ -167,7 +869,7 @@ class EngineRuntimeTests(unittest.TestCase):
             )
 
             with self.assertRaises(SystemExit):
-                run_workflow(workdir=workspace)
+                run_workflow(workdir=workspace, headless=True)
 
             events_path = workspace / RUNTIME_DIR / EVENTS_FILE
             self.assertTrue(events_path.exists())
@@ -213,6 +915,23 @@ class EngineRuntimeTests(unittest.TestCase):
 
             self.assertEqual(cm.exception.code, 1)
             self.assertIn("写入事件日志失败", output)
+
+    def test_run_workflow_fails_fast_without_tty_in_interactive_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "PROPOSAL.md").write_text("proposal", encoding="utf-8")
+            (workspace / "TASK.md").write_text("# 当前任务 (Task)\n", encoding="utf-8")
+            load_or_init_project_config(workspace)
+
+            output_buffer = io.StringIO()
+            with patch("centaur.engine.has_interactive_tty", return_value=False), redirect_stdout(output_buffer):
+                with self.assertRaises(SystemExit) as cm:
+                    run_workflow(workdir=workspace)
+            output = output_buffer.getvalue()
+
+            self.assertEqual(cm.exception.code, 1)
+            self.assertIn("不是交互终端", output)
+            self.assertIn("--headless", output)
 
 
 if __name__ == "__main__":
