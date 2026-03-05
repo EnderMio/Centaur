@@ -5,6 +5,7 @@ from importlib.resources import files
 import subprocess
 import shutil
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -86,7 +87,47 @@ def check_env(workdir: Path) -> None:
         raise SystemExit(1)
 
 
-def run_agent(role: str, prompt_filename: str, workdir: Path, prompt_mode: str) -> None:
+def _role_log_filename(role: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "_", role.strip().lower()).strip("_")
+    role_name = normalized or "unknown"
+    return f"{role_name}.log"
+
+
+def _iso_utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _write_role_execution_log(
+    workdir: Path,
+    role: str,
+    cycle: int,
+    command: list[str],
+    start_time: str,
+    end_time: str,
+    return_code: int | None,
+    stdout: str,
+    stderr: str,
+) -> None:
+    ensure_runtime_layout(workdir)
+    filename = f"cycle_{cycle}_{_role_log_filename(role)}"
+    log_path = get_logs_dir(workdir) / filename
+    payload = {
+        "role": role,
+        "cycle": cycle,
+        "command": command,
+        "start_time": start_time,
+        "end_time": end_time,
+        "return_code": return_code,
+        "stdout": stdout,
+        "stderr": stderr,
+    }
+    try:
+        log_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as exc:
+        print(f"[⚠️] 写入角色执行日志失败: {exc}")
+
+
+def run_agent(role: str, prompt_filename: str, workdir: Path, prompt_mode: str, cycle: int = 0) -> None:
     try:
         prompt_content, source = resolve_prompt_content(workdir, prompt_filename, prompt_mode)
     except FileNotFoundError as exc:
@@ -100,18 +141,48 @@ def run_agent(role: str, prompt_filename: str, workdir: Path, prompt_mode: str) 
         raise SystemExit(1)
 
     print(f"\n[🚀] 正在唤醒 {role}... (提示词来源: {source})")
+    command = ["codex", "--full-auto", prompt_content]
+    start_time = _iso_utc_now()
+    end_time = start_time
+    return_code: int | None = None
+    stdout_text = ""
+    stderr_text = ""
     try:
-        subprocess.run(["codex", "--full-auto", prompt_content], check=True, cwd=workdir)
+        completed = subprocess.run(command, check=False, cwd=workdir, capture_output=True, text=True)
+        end_time = _iso_utc_now()
+        return_code = completed.returncode
+        stdout_text = completed.stdout or ""
+        stderr_text = completed.stderr or ""
+        if stdout_text:
+            print(stdout_text, end="" if stdout_text.endswith("\n") else "\n")
+        if stderr_text:
+            print(stderr_text, end="" if stderr_text.endswith("\n") else "\n")
+        if completed.returncode != 0:
+            print(f"[❌] {role} 异常退出 (RC={completed.returncode})，请检查日志。")
+            raise SystemExit(1)
         print(f"[✅] {role} 运行结束。")
     except FileNotFoundError:
+        end_time = _iso_utc_now()
+        stderr_text = "未找到 `codex` 命令"
         print("❌ 未找到 `codex` 命令，请先安装并配置 Codex CLI。")
         raise SystemExit(1)
-    except subprocess.CalledProcessError as exc:
-        print(f"[❌] {role} 异常退出 (RC={exc.returncode})，请检查日志。")
-        raise SystemExit(1)
     except KeyboardInterrupt:
+        end_time = _iso_utc_now()
+        stderr_text = "执行被手动中止"
         print(f"\n[⚠️] 手动中止 {role}。")
         raise SystemExit(1)
+    finally:
+        _write_role_execution_log(
+            workdir=workdir,
+            role=role,
+            cycle=cycle,
+            command=command,
+            start_time=start_time,
+            end_time=end_time,
+            return_code=return_code,
+            stdout=stdout_text,
+            stderr=stderr_text,
+        )
 
 
 def human_gate() -> None:
@@ -550,7 +621,7 @@ def run_workflow(
         print("█" * 60)
 
         if next_step == "supervisor":
-            run_agent("Supervisor", "SUPERVISOR.md", base, prompt_mode)
+            run_agent("Supervisor", "SUPERVISOR.md", base, prompt_mode, cycle=cycle)
             state["next_step"] = "human_gate"
             save_state(base, state)
             sync_task_bus_to_active(base, active_task)
@@ -564,14 +635,14 @@ def run_workflow(
             continue
 
         if next_step == "worker":
-            run_agent("Worker", "WORKER.md", base, prompt_mode)
+            run_agent("Worker", "WORKER.md", base, prompt_mode, cycle=cycle)
             state["next_step"] = "validator"
             save_state(base, state)
             sync_task_bus_to_active(base, active_task)
             continue
 
         print("\n🔍 Validator 正在审查 Worker 的代码与数据契约...")
-        run_agent("Validator", "VALIDATOR.md", base, prompt_mode)
+        run_agent("Validator", "VALIDATOR.md", base, prompt_mode, cycle=cycle)
         state["cycle"] = cycle + 1
         state["next_step"] = "supervisor"
         save_state(base, state)

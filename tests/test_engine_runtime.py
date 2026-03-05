@@ -1,7 +1,9 @@
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import sys
 
@@ -14,6 +16,7 @@ from centaur.engine import (  # noqa: E402
     RUNTIME_DIR,
     load_or_init_project_config,
     migrate_schema,
+    run_agent,
     sync_task_bus_to_active,
     task_file_path,
     validate_task_name,
@@ -84,6 +87,51 @@ class EngineRuntimeTests(unittest.TestCase):
         self.assertFalse(validate_task_name(" bad"))
         self.assertFalse(validate_task_name(""))
         self.assertFalse(validate_task_name("!invalid"))
+
+    @patch("centaur.engine.resolve_prompt_content", return_value=("worker prompt", "测试模板"))
+    @patch("centaur.engine.subprocess.run")
+    def test_run_agent_log_written_on_success(self, mock_run, _mock_resolve_prompt) -> None:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=["codex", "--full-auto", "worker prompt"],
+            returncode=0,
+            stdout="ok\n",
+            stderr="",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            run_agent("Worker", "WORKER.md", workspace, "global", cycle=2)
+            log_path = workspace / ".centaur" / "logs" / "cycle_2_worker.log"
+            self.assertTrue(log_path.exists())
+            payload = json.loads(log_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["command"], ["codex", "--full-auto", "worker prompt"])
+            self.assertTrue(payload["start_time"])
+            self.assertTrue(payload["end_time"])
+            self.assertEqual(payload["return_code"], 0)
+            self.assertEqual(payload["stdout"], "ok\n")
+            self.assertEqual(payload["stderr"], "")
+
+    @patch("centaur.engine.resolve_prompt_content", return_value=("validator prompt", "测试模板"))
+    @patch("centaur.engine.subprocess.run")
+    def test_run_agent_log_written_on_failure(self, mock_run, _mock_resolve_prompt) -> None:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=["codex", "--full-auto", "validator prompt"],
+            returncode=3,
+            stdout="partial\n",
+            stderr="boom\n",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            with self.assertRaises(SystemExit):
+                run_agent("Validator", "VALIDATOR.md", workspace, "global", cycle=4)
+            log_path = workspace / ".centaur" / "logs" / "cycle_4_validator.log"
+            self.assertTrue(log_path.exists())
+            payload = json.loads(log_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["command"], ["codex", "--full-auto", "validator prompt"])
+            self.assertTrue(payload["start_time"])
+            self.assertTrue(payload["end_time"])
+            self.assertEqual(payload["return_code"], 3)
+            self.assertEqual(payload["stdout"], "partial\n")
+            self.assertEqual(payload["stderr"], "boom\n")
 
 
 if __name__ == "__main__":
