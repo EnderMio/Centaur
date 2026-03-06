@@ -67,6 +67,7 @@
 - 条件字段要求：
   - `COMMIT_CREATED=1` 时必须补齐 `commit_sha` 与 `commit_files`
   - `SEAL_MODE=SEALED_BLOCKED` 时必须补齐 `carryover_reason`、`owner`、`next_min_action`、`due_cycle`
+  - 若 `PATCH_APPLIED=1` 且 `COMMIT_CREATED=0`，必须提供完整 `SEAL_MODE=SEALED_BLOCKED` 映射；否则 Validator 将硬驳回并阻断推进
 ```
 
 补充约束：

@@ -30,6 +30,7 @@
    - 若 `STATUS_HAS_UNSEALED_DIRTY=1`，是否严格走 `SEAL_ONLY` 放行路径；若仍派发功能任务，结论必须是 `BLOCKED_SPEC`。
    - Worker 反馈是否包含 `[CENTAUR_WORKER_END_STATE]`，并完整回填 `PATCH_APPLIED`、`COMMIT_CREATED`、`CARRYOVER_FILES`、`SEAL_MODE`、`RELEASE_DECISION`。
    - 若 `COMMIT_CREATED=1`，是否同时回填 `commit_sha` 与 `commit_files`；若 `SEAL_MODE=SEALED_BLOCKED`，是否同时回填 `carryover_reason`、`owner`、`next_min_action`、`due_cycle`。
+   - 命中 `PATCH_APPLIED=1` 且 `COMMIT_CREATED=0` 时，若未满足 `SEAL_MODE=SEALED_BLOCKED` 最小映射字段，必须直接判定驳回并阻断推进（不得进入下一阶段）。
    - 不得把“是否提供执行步骤”作为放行前提，审查依据始终是目标/约束/验收与可复现证据。
    - 命中 `TASK.md` 已声明的项目规则且包含重试或权限升级动作时，必须核对“首次失败与后续执行双证据闭环”，不得仅凭口头描述放行。
 

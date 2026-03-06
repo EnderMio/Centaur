@@ -273,6 +273,7 @@ class InitTemplateRegressionTests(unittest.TestCase):
             self.assertIn("CARRYOVER_FILES", supervisor_template)
             self.assertIn("SEAL_MODE", supervisor_template)
             self.assertIn("RELEASE_DECISION", supervisor_template)
+            self.assertIn("若 `PATCH_APPLIED=1` 且 `COMMIT_CREATED=0`", supervisor_template)
 
     def test_init_freeze_prompts_writes_rule_maintenance_mechanism_and_role_guidance(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -314,6 +315,7 @@ class InitTemplateRegressionTests(unittest.TestCase):
             self.assertIn("[CENTAUR_SUPERVISOR_DISPATCH_GATE]", validator_template)
             self.assertIn("SEAL_ONLY", validator_template)
             self.assertIn("[CENTAUR_WORKER_END_STATE]", validator_template)
+            self.assertIn("命中 `PATCH_APPLIED=1` 且 `COMMIT_CREATED=0`", validator_template)
             self.assertNotIn("共享内存权限错误需提权重跑", validator_template)
 
             project_status_template = (workspace / "PROJECT_STATUS.md").read_text(encoding="utf-8")

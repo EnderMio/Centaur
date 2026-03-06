@@ -53,6 +53,10 @@ ROLE_LABELS = {
 TRANSACTION_STATE_FIELDS = ("inflight_role", "run_id", "started_at", "attempt")
 TASK_COMPLETION_EVIDENCE_PREFIX = "[CENTAUR_ROLE_COMPLETION] "
 TASK_CONTRACT_PREFIX = "[CENTAUR_TASK_CONTRACT] "
+WORKER_REPORT_HEADER = "### Worker 执行报告"
+WORKER_END_STATE_PREFIX = "[CENTAUR_WORKER_END_STATE] "
+SEALED_BLOCKED_MODE = "SEALED_BLOCKED"
+SEALED_BLOCKED_MIN_FIELDS = ("carryover_reason", "owner", "next_min_action", "due_cycle")
 CHECKPOINT_ROLE = "validator"
 WORKER_RESULT_SUCCESS = "success"
 WORKER_RESULT_FAILED = "failed"
@@ -1511,6 +1515,96 @@ def _task_has_completion_evidence(workdir: Path, cycle: int, role: str, run_id: 
     return False
 
 
+def _find_latest_worker_end_state_payload(workdir: Path) -> tuple[dict[str, Any] | None, list[str], bool]:
+    task_path = workdir / "TASK.md"
+    if not task_path.exists():
+        return None, [], False
+
+    try:
+        lines = task_path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        return None, [f"读取 TASK.md 失败: {exc}"], False
+
+    latest_worker_index = -1
+    for index, raw_line in enumerate(lines):
+        if raw_line.strip().startswith(WORKER_REPORT_HEADER):
+            latest_worker_index = index
+
+    if latest_worker_index < 0:
+        return None, [], False
+
+    for raw_line in reversed(lines[latest_worker_index + 1 :]):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if not line.startswith(WORKER_END_STATE_PREFIX):
+            continue
+
+        payload_text = line[len(WORKER_END_STATE_PREFIX) :].strip()
+        try:
+            payload = json.loads(payload_text)
+        except json.JSONDecodeError as exc:
+            return None, [f"`{WORKER_END_STATE_PREFIX.strip()}` JSON 非法: {exc}"], True
+
+        if not isinstance(payload, dict):
+            return None, [f"`{WORKER_END_STATE_PREFIX.strip()}` 载荷必须是 JSON 对象"], True
+        return payload, [], True
+
+    return None, [f"最新 Worker 执行报告缺少 `{WORKER_END_STATE_PREFIX.strip()}` 回填字段"], True
+
+
+def _is_nonempty_string(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _is_valid_due_cycle(value: Any) -> bool:
+    if value is None or isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return True
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _sealed_blocked_missing_fields(payload: dict[str, Any]) -> list[str]:
+    missing: list[str] = []
+    for field_name in SEALED_BLOCKED_MIN_FIELDS:
+        value = payload.get(field_name)
+        if field_name == "due_cycle":
+            if not _is_valid_due_cycle(value):
+                missing.append(field_name)
+            continue
+        if not _is_nonempty_string(value):
+            missing.append(field_name)
+    return missing
+
+
+def _validator_hard_reject_reasons(workdir: Path) -> list[str]:
+    payload, _parse_errors, worker_report_found = _find_latest_worker_end_state_payload(workdir)
+    if not worker_report_found or payload is None:
+        return []
+
+    patch_applied = _coerce_int(payload.get("PATCH_APPLIED"))
+    commit_created = _coerce_int(payload.get("COMMIT_CREATED"))
+    if patch_applied != 1 or commit_created != 0:
+        return []
+
+    seal_mode = str(payload.get("SEAL_MODE", "")).strip().upper()
+    if seal_mode != SEALED_BLOCKED_MODE:
+        return [
+            "命中硬驳回规则：`PATCH_APPLIED=1` 且 `COMMIT_CREATED=0`，"
+            f"但 `SEAL_MODE` 为 `{seal_mode or '<empty>'}`，未映射为 `{SEALED_BLOCKED_MODE}`。"
+        ]
+
+    missing_fields = _sealed_blocked_missing_fields(payload)
+    if missing_fields:
+        joined = ", ".join(missing_fields)
+        return [
+            "命中硬驳回规则：`PATCH_APPLIED=1` 且 `COMMIT_CREATED=0`，"
+            f"但 `{SEALED_BLOCKED_MODE}` 最小映射字段缺失: {joined}"
+        ]
+    return []
+
+
 def _normalize_task_contract_string_list(value: Any, field_name: str, errors: list[str]) -> list[str]:
     if value is None:
         return []
@@ -1822,6 +1916,25 @@ def _route_worker_non_success_and_stop(
     raise SystemExit(1)
 
 
+def _route_validator_hard_reject_and_stop(
+    workdir: Path,
+    state: dict[str, Any],
+    cycle: int,
+    active_task: str,
+    reasons: list[str],
+) -> None:
+    _clear_role_transaction(state)
+    state["cycle"] = cycle
+    state["next_step"] = "supervisor"
+    save_state(workdir, state)
+    sync_task_bus_to_active(workdir, active_task)
+    print("❌ Validator 硬驳回：命中“功能通过但未提交且无封板映射”规则，已阻断推进并回流 Supervisor。")
+    for reason in reasons:
+        print(f"   - {reason}")
+    print("   [NEXT_STEP] Supervisor 需派发回流任务：要求 Worker 创建 commit，或补齐 `SEALED_BLOCKED` 封板映射。")
+    raise SystemExit(1)
+
+
 def list_tasks(workdir: Path) -> list[str]:
     tasks_dir = get_tasks_dir(workdir)
     if not tasks_dir.exists():
@@ -1932,6 +2045,12 @@ def _recover_inflight_role_state(workdir: Path, state: dict[str, Any]) -> dict[s
     gate_failures = _verify_role_dual_gate(workdir, cycle=cycle, role=inflight_role, run_id=run_id)
     if gate_failures:
         state["next_step"] = inflight_role
+        return state
+
+    hard_reject_reasons = _validator_hard_reject_reasons(workdir)
+    if hard_reject_reasons:
+        _clear_role_transaction(state)
+        state["next_step"] = "supervisor"
         return state
 
     _apply_success_transition_from_recovered_role(workdir, state, inflight_role, cycle)
@@ -2285,6 +2404,15 @@ def run_workflow(
             headless=headless,
             headless_exec_args=headless_exec_args,
         )
+        hard_reject_reasons = _validator_hard_reject_reasons(base)
+        if hard_reject_reasons:
+            _route_validator_hard_reject_and_stop(
+                workdir=base,
+                state=state,
+                cycle=cycle,
+                active_task=active_task,
+                reasons=hard_reject_reasons,
+            )
         append_task_completion_evidence(base, cycle=cycle, role="validator", run_id=run_id)
         gate_failures = _verify_role_dual_gate(base, cycle=cycle, role="validator", run_id=run_id)
         if gate_failures:

@@ -1229,6 +1229,166 @@ class EngineRuntimeTests(unittest.TestCase):
             self.assertIsNone(observed["last_checkpoint_sha"])
             self.assertIn("不是 Git 仓库", output)
 
+    def test_run_workflow_validator_hard_rejects_unsealed_uncommitted_patch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "PROPOSAL.md").write_text("proposal", encoding="utf-8")
+            worker_end_state = "[CENTAUR_WORKER_END_STATE] " + json.dumps(
+                {
+                    "PATCH_APPLIED": 1,
+                    "COMMIT_CREATED": 0,
+                    "CARRYOVER_FILES": [],
+                    "SEAL_MODE": "UNSEALED",
+                    "RELEASE_DECISION": "READY",
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            (workspace / "TASK.md").write_text(
+                (
+                    "# 当前任务 (Task)\n\n"
+                    "---\n"
+                    "## Worker 反馈区\n"
+                    "### Worker 执行报告 (2026-03-06 12:00 +0800)\n"
+                    f"{worker_end_state}\n"
+                ),
+                encoding="utf-8",
+            )
+            load_or_init_project_config(workspace)
+            ensure_runtime_layout(workspace)
+            (workspace / RUNTIME_DIR / "state.json").write_text(
+                json.dumps({"cycle": 1, "next_step": "validator"}),
+                encoding="utf-8",
+            )
+
+            def _fake_run_agent(*_args, **_kwargs) -> None:
+                append_event(workspace, cycle=1, event_type="role_end", role="validator", return_code=0)
+
+            output_buffer = io.StringIO()
+            with patch("centaur.engine.run_agent", side_effect=_fake_run_agent), redirect_stdout(output_buffer):
+                with self.assertRaises(SystemExit) as cm:
+                    run_workflow(workdir=workspace, headless=True)
+            output = output_buffer.getvalue()
+
+            self.assertEqual(cm.exception.code, 1)
+            state = json.loads((workspace / RUNTIME_DIR / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["cycle"], 1)
+            self.assertEqual(state["next_step"], "supervisor")
+            self.assertIsNone(state["inflight_role"])
+            self.assertIsNone(state["run_id"])
+            self.assertIsNone(state["started_at"])
+            self.assertEqual(state["attempt"], 0)
+
+            self.assertIn("Validator 硬驳回", output)
+            self.assertIn("PATCH_APPLIED=1", output)
+            self.assertIn("SEALED_BLOCKED", output)
+
+            evidence_lines = [
+                line
+                for line in (workspace / "TASK.md").read_text(encoding="utf-8").splitlines()
+                if line.startswith(TASK_COMPLETION_EVIDENCE_PREFIX)
+            ]
+            validator_evidence = [
+                json.loads(line[len(TASK_COMPLETION_EVIDENCE_PREFIX) :])
+                for line in evidence_lines
+                if json.loads(line[len(TASK_COMPLETION_EVIDENCE_PREFIX) :]).get("role") == "validator"
+            ]
+            self.assertFalse(validator_evidence)
+
+    def test_run_workflow_validator_allows_commit_or_sealed_blocked_end_state(self) -> None:
+        cases = (
+            (
+                "commit_created",
+                {
+                    "PATCH_APPLIED": 1,
+                    "COMMIT_CREATED": 1,
+                    "CARRYOVER_FILES": [],
+                    "SEAL_MODE": "UNSEALED",
+                    "RELEASE_DECISION": "READY",
+                    "commit_sha": "abc123",
+                    "commit_files": ["src/centaur/engine.py"],
+                },
+            ),
+            (
+                "sealed_blocked",
+                {
+                    "PATCH_APPLIED": 1,
+                    "COMMIT_CREATED": 0,
+                    "CARRYOVER_FILES": ["src/centaur/engine.py"],
+                    "SEAL_MODE": "SEALED_BLOCKED",
+                    "RELEASE_DECISION": "PENDING",
+                    "carryover_reason": "等待主管确认",
+                    "owner": "worker",
+                    "next_min_action": "补齐提交策略",
+                    "due_cycle": 2,
+                },
+            ),
+        )
+
+        for case_name, end_state_payload in cases:
+            with self.subTest(case=case_name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    workspace = Path(tmp)
+                    (workspace / "PROPOSAL.md").write_text("proposal", encoding="utf-8")
+                    worker_end_state = "[CENTAUR_WORKER_END_STATE] " + json.dumps(
+                        end_state_payload, ensure_ascii=False, sort_keys=True
+                    )
+                    (workspace / "TASK.md").write_text(
+                        (
+                            "# 当前任务 (Task)\n\n"
+                            "---\n"
+                            "## Worker 反馈区\n"
+                            "### Worker 执行报告 (2026-03-06 12:00 +0800)\n"
+                            f"{worker_end_state}\n"
+                        ),
+                        encoding="utf-8",
+                    )
+                    load_or_init_project_config(workspace)
+                    ensure_runtime_layout(workspace)
+                    (workspace / RUNTIME_DIR / "state.json").write_text(
+                        json.dumps({"cycle": 1, "next_step": "validator"}),
+                        encoding="utf-8",
+                    )
+
+                    sync_counter = {"value": 0}
+                    observed: dict[str, object] = {}
+
+                    def _fake_run_agent(*_args, **_kwargs) -> None:
+                        append_event(workspace, cycle=1, event_type="role_end", role="validator", return_code=0)
+
+                    def _fake_sync_task_bus_to_active(_workdir: Path, _active_task: str) -> None:
+                        sync_counter["value"] += 1
+                        if sync_counter["value"] == 2:
+                            observed.update(json.loads((workspace / RUNTIME_DIR / "state.json").read_text(encoding="utf-8")))
+                            raise SystemExit(206)
+
+                    output_buffer = io.StringIO()
+                    with patch("centaur.engine.run_agent", side_effect=_fake_run_agent), patch(
+                        "centaur.engine.sync_task_bus_to_active", side_effect=_fake_sync_task_bus_to_active
+                    ), redirect_stdout(output_buffer):
+                        with self.assertRaises(SystemExit) as cm:
+                            run_workflow(workdir=workspace, headless=True)
+                    output = output_buffer.getvalue()
+
+                    self.assertEqual(cm.exception.code, 206)
+                    self.assertEqual(observed["cycle"], 2)
+                    self.assertEqual(observed["next_step"], "supervisor")
+                    self.assertNotIn("Validator 硬驳回", output)
+
+                    evidence_lines = [
+                        line
+                        for line in (workspace / "TASK.md").read_text(encoding="utf-8").splitlines()
+                        if line.startswith(TASK_COMPLETION_EVIDENCE_PREFIX)
+                    ]
+                    validator_evidence = [
+                        json.loads(line[len(TASK_COMPLETION_EVIDENCE_PREFIX) :])
+                        for line in evidence_lines
+                        if json.loads(line[len(TASK_COMPLETION_EVIDENCE_PREFIX) :]).get("role") == "validator"
+                    ]
+                    self.assertTrue(validator_evidence)
+                    self.assertEqual(validator_evidence[-1]["cycle"], 1)
+                    self.assertEqual(validator_evidence[-1]["status"], "completed")
+
     def test_run_workflow_cycle_boundary_allows_clean_git_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
