@@ -116,6 +116,71 @@ class ErrorTemplateTests(unittest.TestCase):
             self.assert_error_template(output)
 
 
+class RunCommandGuardrailTests(unittest.TestCase):
+    def test_run_rejects_from_role_without_force_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            output_buffer = io.StringIO()
+            with patch("centaur.cli.run_workflow") as mock_run_workflow, redirect_stdout(output_buffer):
+                rc = cli.main(["run", str(workspace), "--from-role", "worker"])
+            output = output_buffer.getvalue()
+
+            self.assertEqual(rc, 1)
+            mock_run_workflow.assert_not_called()
+            self.assertIn("[CLI_ERROR]", output)
+            self.assertIn("--force-from-role", output)
+            self.assertIn("[NEXT_STEP]", output)
+
+    def test_run_rejects_force_from_role_without_target_role(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            output_buffer = io.StringIO()
+            with patch("centaur.cli.run_workflow") as mock_run_workflow, redirect_stdout(output_buffer):
+                rc = cli.main(["run", str(workspace), "--force-from-role"])
+            output = output_buffer.getvalue()
+
+            self.assertEqual(rc, 1)
+            mock_run_workflow.assert_not_called()
+            self.assertIn("[CLI_ERROR]", output)
+            self.assertIn("--from-role", output)
+            self.assertIn("[NEXT_STEP]", output)
+
+    def test_run_allows_from_role_with_explicit_force_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            observed: dict[str, object] = {}
+
+            def _fake_run_workflow(
+                workdir: Path,
+                start_step: str | None = None,
+                allow_repo_root: bool = False,
+                headless: bool = False,
+            ) -> None:
+                observed["workdir"] = workdir
+                observed["start_step"] = start_step
+                observed["allow_repo_root"] = allow_repo_root
+                observed["headless"] = headless
+
+            with patch("centaur.cli.run_workflow", side_effect=_fake_run_workflow):
+                rc = cli.main(
+                    [
+                        "run",
+                        str(workspace),
+                        "--from-role",
+                        "worker",
+                        "--force-from-role",
+                        "--allow-repo-root",
+                        "--headless",
+                    ]
+                )
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(observed["workdir"], workspace.resolve())
+            self.assertEqual(observed["start_step"], "worker")
+            self.assertEqual(observed["allow_repo_root"], True)
+            self.assertEqual(observed["headless"], True)
+
+
 class TaskLintCommandTests(unittest.TestCase):
     def test_task_lint_reports_blocked_spec_on_contract_conflict(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

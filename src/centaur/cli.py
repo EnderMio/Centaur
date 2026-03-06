@@ -344,9 +344,23 @@ def cmd_task_lint(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
+    if args.force_from_role and args.from_role is None:
+        _emit_cli_error(
+            "检测到 `--force-from-role`，但缺少 `--from-role` 目标角色。",
+            "请改为 `centaur run --from-role <role> --force-from-role`，或移除 `--force-from-role`。",
+        )
+        return 1
+
+    if args.from_role is not None and not args.force_from_role:
+        _emit_cli_error(
+            "默认恢复路径禁止直接使用 `--from-role` 覆盖 inflight 自动恢复。",
+            "移除 `--from-role` 以走自动恢复；如需强制覆盖，请显式追加 `--force-from-role`。",
+        )
+        return 1
+
     run_workflow(
         _resolve_workspace(args.path, args.workspace),
-        start_step=args.from_role,
+        start_step=args.from_role if args.force_from_role else None,
         allow_repo_root=args.allow_repo_root,
         headless=args.headless,
     )
@@ -583,7 +597,12 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--from-role",
         choices=ROLE_ORDER,
-        help="Override resume state and force the next role for this workflow.",
+        help="Target role to force-override resume state (requires --force-from-role).",
+    )
+    run_parser.add_argument(
+        "--force-from-role",
+        action="store_true",
+        help="Explicit confirmation to bypass inflight auto-recovery and apply --from-role.",
     )
     run_parser.add_argument(
         "--allow-repo-root",
