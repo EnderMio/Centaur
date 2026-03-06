@@ -33,6 +33,7 @@
 - 结束态回填 (机审必填):
   [CENTAUR_WORKER_END_STATE] {"PATCH_APPLIED":0,"COMMIT_CREATED":0,"CARRYOVER_FILES":[],"SEAL_MODE":"UNSEALED","RELEASE_DECISION":"PENDING"}
   - `COMMIT_CREATED=1` 时必须补齐 `commit_sha` 与 `commit_files`
+  - `commit_files` 必须与 `git show --name-only --pretty=format: <commit_sha>` 机证一致
   - `SEAL_MODE=SEALED_BLOCKED` 时必须补齐 `carryover_reason`、`owner`、`next_min_action`、`due_cycle`
 ```
 

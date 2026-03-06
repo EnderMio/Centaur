@@ -1675,6 +1675,213 @@ class EngineRuntimeTests(unittest.TestCase):
                     self.assertEqual(payload["status"], "completed")
                     self.assertTrue(payload["run_id"])
 
+    def test_run_workflow_blocks_before_validator_when_worker_end_state_mismatches_git_machine_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            tracked_file = workspace / "feature.txt"
+            tracked_file.write_text("v1\n", encoding="utf-8")
+            (workspace / "PROPOSAL.md").write_text("proposal", encoding="utf-8")
+            (workspace / "TASK.md").write_text(
+                (
+                    "# 当前任务 (Task)\n\n"
+                    "## 机审契约\n"
+                    '[CENTAUR_TASK_CONTRACT] {"version":1,"unit":"set_exact","baseline":"worker-gate","allowed_delta":[],"forbidden_delta":[],"precedence":["forbidden","allowed","wording"]}\n'
+                    '[CENTAUR_SUPERVISOR_DISPATCH_GATE] {"STATUS_CMD":"cd /repo && git status --short -- feature.txt","STATUS_RC":0,"STATUS_HAS_UNSEALED_DIRTY":0,"TARGET_DIFF_CMD":"cd /repo && git diff --name-only -- feature.txt","TARGET_DIFF_RC":0,"TARGET_DIFF_HAS_CHANGES":0,"TASK_KIND":"FEATURE","DISPATCH_DECISION":"ALLOW_FUNCTIONAL"}\n'
+                    "---\n"
+                    "## Worker 反馈区\n"
+                ),
+                encoding="utf-8",
+            )
+
+            subprocess.run(["git", "init"], cwd=workspace, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "Centaur Bot"], cwd=workspace, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.email", "centaur@example.com"], cwd=workspace, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "add", "."], cwd=workspace, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=workspace, check=True, capture_output=True, text=True)
+
+            load_or_init_project_config(workspace)
+            ensure_runtime_layout(workspace)
+            (workspace / RUNTIME_DIR / "state.json").write_text(json.dumps({"cycle": 1, "next_step": "worker"}), encoding="utf-8")
+
+            called_roles: list[str] = []
+
+            def _fake_run_agent(role: str, *_args, **_kwargs) -> None:
+                called_roles.append(role)
+                tracked_file.write_text("v1\ndirty\n", encoding="utf-8")
+                with (workspace / "TASK.md").open("a", encoding="utf-8") as handle:
+                    handle.write("### Worker 执行报告 (2026-03-06 12:00 +0800)\n")
+                    handle.write(
+                        '[CENTAUR_WORKER_END_STATE] {"PATCH_APPLIED":0,"COMMIT_CREATED":0,"CARRYOVER_FILES":[],"SEAL_MODE":"UNSEALED","RELEASE_DECISION":"READY"}\n'
+                    )
+                append_event(workspace, cycle=1, event_type="role_end", role="worker", return_code=0)
+
+            output_buffer = io.StringIO()
+            with patch("centaur.engine.run_agent", side_effect=_fake_run_agent), redirect_stdout(output_buffer):
+                with self.assertRaises(SystemExit) as cm:
+                    run_workflow(workdir=workspace, headless=True)
+            output = output_buffer.getvalue()
+
+            self.assertEqual(cm.exception.code, 1)
+            self.assertEqual(called_roles, ["Worker"])
+            state = json.loads((workspace / RUNTIME_DIR / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["cycle"], 1)
+            self.assertEqual(state["next_step"], "supervisor")
+            self.assertIn("Worker->Validator 强制契约闸门失败", output)
+            self.assertIn("PATCH_APPLIED(claim=0, auto=1)", output)
+            self.assertIn("git rev-parse --is-inside-work-tree", output)
+            self.assertIn("git status --porcelain --untracked-files=all", output)
+
+    def test_run_workflow_blocks_before_validator_on_forged_commit_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            tracked_file = workspace / "feature.txt"
+            tracked_file.write_text("v1\n", encoding="utf-8")
+            (workspace / "PROPOSAL.md").write_text("proposal", encoding="utf-8")
+            (workspace / "TASK.md").write_text(
+                (
+                    "# 当前任务 (Task)\n\n"
+                    "## 机审契约\n"
+                    '[CENTAUR_TASK_CONTRACT] {"version":1,"unit":"set_exact","baseline":"worker-gate-commit","allowed_delta":[],"forbidden_delta":[],"precedence":["forbidden","allowed","wording"]}\n'
+                    '[CENTAUR_SUPERVISOR_DISPATCH_GATE] {"STATUS_CMD":"cd /repo && git status --short -- feature.txt","STATUS_RC":0,"STATUS_HAS_UNSEALED_DIRTY":0,"TARGET_DIFF_CMD":"cd /repo && git diff --name-only -- feature.txt","TARGET_DIFF_RC":0,"TARGET_DIFF_HAS_CHANGES":0,"TASK_KIND":"FEATURE","DISPATCH_DECISION":"ALLOW_FUNCTIONAL"}\n'
+                    "---\n"
+                    "## Worker 反馈区\n"
+                ),
+                encoding="utf-8",
+            )
+
+            subprocess.run(["git", "init"], cwd=workspace, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "Centaur Bot"], cwd=workspace, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.email", "centaur@example.com"], cwd=workspace, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "add", "."], cwd=workspace, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=workspace, check=True, capture_output=True, text=True)
+
+            load_or_init_project_config(workspace)
+            ensure_runtime_layout(workspace)
+            (workspace / RUNTIME_DIR / "state.json").write_text(json.dumps({"cycle": 1, "next_step": "worker"}), encoding="utf-8")
+
+            called_roles: list[str] = []
+
+            def _fake_run_agent(role: str, *_args, **_kwargs) -> None:
+                called_roles.append(role)
+                tracked_file.write_text("v1\nv2\n", encoding="utf-8")
+                with (workspace / "TASK.md").open("a", encoding="utf-8") as handle:
+                    handle.write("### Worker 执行报告 (2026-03-06 12:00 +0800)\n")
+                subprocess.run(["git", "add", "feature.txt", "TASK.md"], cwd=workspace, check=True, capture_output=True, text=True)
+                subprocess.run(["git", "commit", "-m", "worker change"], cwd=workspace, check=True, capture_output=True, text=True)
+                real_head = subprocess.run(
+                    ["git", "rev-parse", "HEAD"], cwd=workspace, check=True, capture_output=True, text=True
+                ).stdout.strip()
+                with (workspace / "TASK.md").open("a", encoding="utf-8") as handle:
+                    handle.write(
+                        (
+                            "[CENTAUR_WORKER_END_STATE] "
+                            + json.dumps(
+                                {
+                                    "PATCH_APPLIED": 1,
+                                    "COMMIT_CREATED": 1,
+                                    "CARRYOVER_FILES": [],
+                                    "SEAL_MODE": "UNSEALED",
+                                    "RELEASE_DECISION": "READY",
+                                    "commit_sha": real_head,
+                                    "commit_files": ["fake.txt"],
+                                },
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            )
+                            + "\n"
+                        )
+                    )
+                append_event(workspace, cycle=1, event_type="role_end", role="worker", return_code=0)
+
+            output_buffer = io.StringIO()
+            with patch("centaur.engine.run_agent", side_effect=_fake_run_agent), redirect_stdout(output_buffer):
+                with self.assertRaises(SystemExit) as cm:
+                    run_workflow(workdir=workspace, headless=True)
+            output = output_buffer.getvalue()
+
+            self.assertEqual(cm.exception.code, 1)
+            self.assertEqual(called_roles, ["Worker"])
+            state = json.loads((workspace / RUNTIME_DIR / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["cycle"], 1)
+            self.assertEqual(state["next_step"], "supervisor")
+            self.assertIn("Worker->Validator 强制契约闸门失败", output)
+            self.assertIn("`commit_files` 与 Git 机证不一致", output)
+
+    def test_run_workflow_validator_fail_closed_on_missing_worker_end_state_line(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "PROPOSAL.md").write_text("proposal", encoding="utf-8")
+            (workspace / "TASK.md").write_text(
+                (
+                    "# 当前任务 (Task)\n\n"
+                    "---\n"
+                    "## Worker 反馈区\n"
+                    "### Worker 执行报告 (2026-03-06 12:00 +0800)\n"
+                    "- 状态: 成功\n"
+                ),
+                encoding="utf-8",
+            )
+            load_or_init_project_config(workspace)
+            ensure_runtime_layout(workspace)
+            (workspace / RUNTIME_DIR / "state.json").write_text(json.dumps({"cycle": 1, "next_step": "validator"}), encoding="utf-8")
+
+            def _fake_run_agent(*_args, **_kwargs) -> None:
+                append_event(workspace, cycle=1, event_type="role_end", role="validator", return_code=0)
+
+            output_buffer = io.StringIO()
+            with patch("centaur.engine.run_agent", side_effect=_fake_run_agent), redirect_stdout(output_buffer):
+                with self.assertRaises(SystemExit) as cm:
+                    run_workflow(workdir=workspace, headless=True)
+            output = output_buffer.getvalue()
+
+            self.assertEqual(cm.exception.code, 1)
+            state = json.loads((workspace / RUNTIME_DIR / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["cycle"], 1)
+            self.assertEqual(state["next_step"], "supervisor")
+            self.assertIn("结束态机审失败（Fail-Closed）", output)
+            self.assertIn("缺少 `[CENTAUR_WORKER_END_STATE]`", output)
+
+    def test_run_workflow_blocks_non_git_feature_task_kind_before_validator(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "PROPOSAL.md").write_text("proposal", encoding="utf-8")
+            (workspace / "TASK.md").write_text(
+                (
+                    "# 当前任务 (Task)\n\n"
+                    "## 机审契约\n"
+                    '[CENTAUR_TASK_CONTRACT] {"version":1,"unit":"set_exact","baseline":"non-git-feature","allowed_delta":[],"forbidden_delta":[],"precedence":["forbidden","allowed","wording"]}\n'
+                    '[CENTAUR_SUPERVISOR_DISPATCH_GATE] {"STATUS_CMD":"cd /repo && git status --short -- feature.txt","STATUS_RC":0,"STATUS_HAS_UNSEALED_DIRTY":0,"TARGET_DIFF_CMD":"cd /repo && git diff --name-only -- feature.txt","TARGET_DIFF_RC":0,"TARGET_DIFF_HAS_CHANGES":0,"TASK_KIND":"FEATURE","DISPATCH_DECISION":"ALLOW_FUNCTIONAL"}\n'
+                    "---\n"
+                    "## Worker 反馈区\n"
+                ),
+                encoding="utf-8",
+            )
+
+            load_or_init_project_config(workspace)
+            ensure_runtime_layout(workspace)
+            (workspace / RUNTIME_DIR / "state.json").write_text(json.dumps({"cycle": 1, "next_step": "worker"}), encoding="utf-8")
+
+            def _fake_run_agent(*_args, **_kwargs) -> None:
+                with (workspace / "TASK.md").open("a", encoding="utf-8") as handle:
+                    handle.write("### Worker 执行报告 (2026-03-06 12:00 +0800)\n")
+                    handle.write(
+                        '[CENTAUR_WORKER_END_STATE] {"PATCH_APPLIED":0,"COMMIT_CREATED":0,"CARRYOVER_FILES":[],"SEAL_MODE":"UNSEALED","RELEASE_DECISION":"READY"}\n'
+                    )
+                append_event(workspace, cycle=1, event_type="role_end", role="worker", return_code=0)
+
+            output_buffer = io.StringIO()
+            with patch("centaur.engine.run_agent", side_effect=_fake_run_agent), redirect_stdout(output_buffer):
+                with self.assertRaises(SystemExit) as cm:
+                    run_workflow(workdir=workspace, headless=True)
+            output = output_buffer.getvalue()
+
+            self.assertEqual(cm.exception.code, 1)
+            state = json.loads((workspace / RUNTIME_DIR / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["cycle"], 1)
+            self.assertEqual(state["next_step"], "supervisor")
+            self.assertIn("非 Git 工作区禁止 `TASK_KIND=FEATURE`", output)
+            self.assertIn("[NEXT_STEP]", output)
+
     def test_append_event_refreshes_runtime_metrics_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)

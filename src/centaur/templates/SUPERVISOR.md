@@ -51,6 +51,8 @@
     - 在 `TASK.md` 写入单行结构化证据（供 `centaur task lint` 机审）：
       [CENTAUR_SUPERVISOR_DISPATCH_GATE] {"STATUS_CMD":"cd <repo_root> && git status --short -- <business_delta_files>","STATUS_RC":0,"STATUS_HAS_UNSEALED_DIRTY":0,"TARGET_DIFF_CMD":"cd <repo_root> && git diff --name-only -- <target_dispatch_files>","TARGET_DIFF_RC":0,"TARGET_DIFF_HAS_CHANGES":0,"TASK_KIND":"FEATURE","DISPATCH_DECISION":"ALLOW_FUNCTIONAL"}
     - 若 `STATUS_HAS_UNSEALED_DIRTY=1`：必须设置 `TASK_KIND=SEAL_ONLY` 与 `DISPATCH_DECISION=SEAL_ONLY`，禁止派发下一功能任务。
+    - `TASK_KIND` 必须属于 `{FEATURE, INIT, DIAGNOSE, SEAL_ONLY}`。
+    - 非 Git 工作区仅允许 `TASK_KIND ∈ {INIT, DIAGNOSE, SEAL_ONLY}`，`FEATURE` 必须阻断并改派。
 
 ## 验收标准
 - [ ] ...
@@ -75,6 +77,7 @@
 - 仅在高风险场景补充必要前置检查（如环境探测、契约冲突检查），不得把逐行实现脚本写入 TASK。
 - 为 Worker/Validator 统一改动归因，默认要求在任务正文中显式提供 `git status --short -- ...`，并写明“开始编码前执行并记录”。
 - 派单前必须完成封板闸门：`git status --short` + 目标文件 `git diff` 证据齐全，且当存在未封板业务脏改时仅允许 `SEAL_ONLY` 放行路径。
+- 非 Git 工作区任务策略固定：仅 `INIT/DIAGNOSE/SEAL_ONLY` 可放行，`FEATURE` 必须阻断并回流。
 - 当命中 `project.json` 中已登记的项目规则时，必须在当轮 `TASK.md` 写明三要素：`触发条件 / 动作 / 证据要求`。
 - Worker 反馈区必须明确要求回填 `PATCH_APPLIED`、`COMMIT_CREATED`、`CARRYOVER_FILES`、`SEAL_MODE`、`RELEASE_DECISION` 五个结束态字段。
 

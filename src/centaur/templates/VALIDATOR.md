@@ -27,9 +27,12 @@
    - 是否破坏文件驱动与无状态原则。
    - 是否改动了任务边界之外的文件。
    - Supervisor 派单前封板闸门是否回填 `[CENTAUR_SUPERVISOR_DISPATCH_GATE]`，并至少覆盖 `git status --short` 与目标文件 `git diff` 的执行证据和决策字段（`TASK_KIND`/`DISPATCH_DECISION`）。
+   - `TASK_KIND` 是否严格属于 `{FEATURE, INIT, DIAGNOSE, SEAL_ONLY}`；若非法必须 `BLOCKED_SPEC`。
+   - 非 Git 工作区是否阻断 `TASK_KIND=FEATURE`（仅允许 `INIT/DIAGNOSE/SEAL_ONLY`）。
    - 若 `STATUS_HAS_UNSEALED_DIRTY=1`，是否严格走 `SEAL_ONLY` 放行路径；若仍派发功能任务，结论必须是 `BLOCKED_SPEC`。
    - Worker 反馈是否包含 `[CENTAUR_WORKER_END_STATE]`，并完整回填 `PATCH_APPLIED`、`COMMIT_CREATED`、`CARRYOVER_FILES`、`SEAL_MODE`、`RELEASE_DECISION`。
-   - 若 `COMMIT_CREATED=1`，是否同时回填 `commit_sha` 与 `commit_files`；若 `SEAL_MODE=SEALED_BLOCKED`，是否同时回填 `carryover_reason`、`owner`、`next_min_action`、`due_cycle`。
+   - 若 `COMMIT_CREATED=1`，是否同时回填 `commit_sha` 与 `commit_files`，且 `commit_files` 与 `git show --name-only --pretty=format: <commit_sha>` 一致；若 `SEAL_MODE=SEALED_BLOCKED`，是否同时回填 `carryover_reason`、`owner`、`next_min_action`、`due_cycle`。
+   - 对 end-state 解析缺失/JSON 非法/字段非法执行 Fail-Closed，不得静默放行到下一阶段。
    - 命中 `PATCH_APPLIED=1` 且 `COMMIT_CREATED=0` 时，若未满足 `SEAL_MODE=SEALED_BLOCKED` 最小映射字段，必须直接判定驳回并阻断推进（不得进入下一阶段）。
    - 不得把“是否提供执行步骤”作为放行前提，审查依据始终是目标/约束/验收与可复现证据。
    - 命中 `TASK.md` 已声明的项目规则且包含重试或权限升级动作时，必须核对“首次失败与后续执行双证据闭环”，不得仅凭口头描述放行。

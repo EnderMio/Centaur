@@ -4,6 +4,7 @@ import argparse
 import json
 from importlib.resources import files
 from pathlib import Path
+import subprocess
 import time
 
 from centaur import __version__
@@ -72,7 +73,8 @@ SUPERVISOR_DISPATCH_GATE_REQUIRED_FIELDS = (
     "TASK_KIND",
     "DISPATCH_DECISION",
 )
-SUPERVISOR_DISPATCH_GATE_TASK_KINDS = ("FEATURE", "SEAL_ONLY")
+SUPERVISOR_DISPATCH_GATE_TASK_KINDS = ("FEATURE", "INIT", "DIAGNOSE", "SEAL_ONLY")
+NON_GIT_ALLOWED_TASK_KINDS = ("INIT", "DIAGNOSE", "SEAL_ONLY")
 SUPERVISOR_DISPATCH_GATE_DECISIONS = ("ALLOW_FUNCTIONAL", "SEAL_ONLY")
 
 
@@ -95,6 +97,15 @@ def _read_task_lines(task_path: Path) -> tuple[list[str], list[str]]:
         return task_path.read_text(encoding="utf-8").splitlines(), []
     except OSError as exc:
         return [], [f"读取 TASK.md 失败: {exc}"]
+
+
+def _run_git(workdir: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["git", *args], cwd=workdir, check=False, capture_output=True, text=True)
+
+
+def _is_git_workspace(workdir: Path) -> bool:
+    probe = _run_git(workdir, ["rev-parse", "--is-inside-work-tree"])
+    return probe.returncode == 0 and probe.stdout.strip().lower() == "true"
 
 
 def _normalize_required_string_list(value: object, field_name: str, errors: list[str], *, allow_empty: bool) -> list[str]:
@@ -155,7 +166,7 @@ def _find_latest_supervisor_dispatch_gate_payload(task_path: Path) -> tuple[dict
     return None, [f"缺少 `{SUPERVISOR_DISPATCH_GATE_PREFIX.strip()}` 派单封板闸门证据"]
 
 
-def _lint_supervisor_dispatch_gate(task_path: Path) -> tuple[list[str], list[str]]:
+def _lint_supervisor_dispatch_gate(task_path: Path, workspace: Path) -> tuple[list[str], list[str]]:
     errors: list[str] = []
     warnings: list[str] = []
 
@@ -204,6 +215,12 @@ def _lint_supervisor_dispatch_gate(task_path: Path) -> tuple[list[str], list[str
         if task_kind != "SEAL_ONLY":
             errors.append("检测到未封板业务脏改时，功能任务必须阻断；仅允许 `TASK_KIND=SEAL_ONLY`")
 
+    if task_kind and not _is_git_workspace(workspace):
+        if task_kind == "FEATURE":
+            errors.append("非 Git 工作区禁止 `TASK_KIND=FEATURE`，仅允许 `INIT/DIAGNOSE/SEAL_ONLY`")
+        elif task_kind not in NON_GIT_ALLOWED_TASK_KINDS:
+            errors.append(f"非 Git 工作区 `TASK_KIND` 非法，必须是 {NON_GIT_ALLOWED_TASK_KINDS}")
+
     return errors, warnings
 
 
@@ -240,7 +257,7 @@ def _find_latest_worker_end_state_payload(task_path: Path) -> tuple[dict[str, ob
     return None, [f"最新 Worker 执行报告缺少 `{WORKER_END_STATE_PREFIX.strip()}` 回填字段"], True
 
 
-def _lint_worker_end_state(task_path: Path) -> tuple[list[str], list[str]]:
+def _lint_worker_end_state(task_path: Path, workspace: Path) -> tuple[list[str], list[str]]:
     errors: list[str] = []
     warnings: list[str] = []
 
@@ -262,9 +279,11 @@ def _lint_worker_end_state(task_path: Path) -> tuple[list[str], list[str]]:
     seal_mode = _normalize_required_nonempty_string(payload.get("SEAL_MODE"), "SEAL_MODE", errors)
     _normalize_required_nonempty_string(payload.get("RELEASE_DECISION"), "RELEASE_DECISION", errors)
 
+    commit_sha = ""
+    commit_files: list[str] = []
     if commit_created == 1:
-        _normalize_required_nonempty_string(payload.get("commit_sha"), "commit_sha", errors)
-        _normalize_required_string_list(payload.get("commit_files"), "commit_files", errors, allow_empty=False)
+        commit_sha = _normalize_required_nonempty_string(payload.get("commit_sha"), "commit_sha", errors)
+        commit_files = _normalize_required_string_list(payload.get("commit_files"), "commit_files", errors, allow_empty=False)
 
     if seal_mode.upper() == "SEALED_BLOCKED":
         _normalize_required_nonempty_string(payload.get("carryover_reason"), "carryover_reason", errors)
@@ -278,6 +297,31 @@ def _lint_worker_end_state(task_path: Path) -> tuple[list[str], list[str]]:
             or (not isinstance(due_cycle, (int, str)))
         ):
             errors.append("`SEAL_MODE=SEALED_BLOCKED` 时必须提供非空 `due_cycle`")
+
+    if commit_created == 1 and commit_sha:
+        if not _is_git_workspace(workspace):
+            errors.append("非 Git 工作区无法验证 `commit_sha/commit_files`，请改用可复验的 Git 证据。")
+            return errors, warnings
+
+        verify = _run_git(workspace, ["cat-file", "-e", f"{commit_sha}^{{commit}}"])
+        if verify.returncode != 0:
+            detail = verify.stderr.strip() or verify.stdout.strip() or "unknown"
+            errors.append(f"`commit_sha` 不可达: {commit_sha} ({detail})")
+            return errors, warnings
+
+        show = _run_git(workspace, ["show", "--name-only", "--pretty=format:", commit_sha])
+        if show.returncode != 0:
+            detail = show.stderr.strip() or show.stdout.strip() or "unknown"
+            errors.append(f"`commit_files` 校验失败：无法执行 `git show --name-only --pretty=format: {commit_sha}` ({detail})")
+            return errors, warnings
+
+        declared_files = sorted({item.strip() for item in commit_files if item.strip()})
+        actual_files = sorted({line.strip() for line in show.stdout.splitlines() if line.strip()})
+        if declared_files != actual_files:
+            errors.append(
+                "`commit_files` 与 `git show --name-only` 不一致: "
+                f"declared={declared_files}, actual={actual_files}"
+            )
 
     return errors, warnings
 
@@ -556,11 +600,11 @@ def cmd_task_lint(args: argparse.Namespace) -> int:
 
     errors, warnings, contract = lint_task_contract(target_dir)
     if contract is not None:
-        dispatch_gate_errors, dispatch_gate_warnings = _lint_supervisor_dispatch_gate(target_dir / "TASK.md")
+        dispatch_gate_errors, dispatch_gate_warnings = _lint_supervisor_dispatch_gate(target_dir / "TASK.md", target_dir)
         errors.extend(dispatch_gate_errors)
         warnings.extend(dispatch_gate_warnings)
 
-        end_state_errors, end_state_warnings = _lint_worker_end_state(target_dir / "TASK.md")
+        end_state_errors, end_state_warnings = _lint_worker_end_state(target_dir / "TASK.md", target_dir)
         errors.extend(end_state_errors)
         warnings.extend(end_state_warnings)
 
@@ -574,6 +618,8 @@ def cmd_task_lint(args: argparse.Namespace) -> int:
 
     if errors:
         print("结论: BLOCKED_SPEC")
+        print("[NEXT_STEP] 修复 TASK.md 机审字段后重试 `centaur task lint`")
+        print("[NEXT_STEP] 若是任务类型冲突，请由 Supervisor 修正 `TASK_KIND` 后重新派单")
         return 1
     print("结论: PASS")
     return 0

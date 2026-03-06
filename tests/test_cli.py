@@ -1,9 +1,12 @@
+from __future__ import annotations
+
 from contextlib import redirect_stdout
 import argparse
 from importlib.resources import files
 import io
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -345,7 +348,7 @@ class InitTemplateRegressionTests(unittest.TestCase):
                 '[CENTAUR_SUPERVISOR_DISPATCH_GATE] '
                 '{"STATUS_CMD":"cd /repo && git status --short -- src/centaur/cli.py","STATUS_RC":0,"STATUS_HAS_UNSEALED_DIRTY":0,'
                 '"TARGET_DIFF_CMD":"cd /repo && git diff --name-only -- src/centaur/cli.py","TARGET_DIFF_RC":0,'
-                '"TARGET_DIFF_HAS_CHANGES":0,"TASK_KIND":"FEATURE","DISPATCH_DECISION":"ALLOW_FUNCTIONAL"}'
+                '"TARGET_DIFF_HAS_CHANGES":0,"TASK_KIND":"DIAGNOSE","DISPATCH_DECISION":"ALLOW_FUNCTIONAL"}'
             )
             (workspace / "TASK.md").write_text(
                 f"# 当前任务 (Task)\n\n## 机审契约\n{contract_line}\n{dispatch_gate_line}\n",
@@ -445,7 +448,7 @@ class TaskContractLintTests(unittest.TestCase):
         "TARGET_DIFF_CMD": "cd /repo && git diff --name-only -- src/centaur/cli.py tests/test_cli.py",
         "TARGET_DIFF_RC": 0,
         "TARGET_DIFF_HAS_CHANGES": 0,
-        "TASK_KIND": "FEATURE",
+        "TASK_KIND": "DIAGNOSE",
         "DISPATCH_DECISION": "ALLOW_FUNCTIONAL",
     }
 
@@ -697,6 +700,55 @@ class TaskContractLintTests(unittest.TestCase):
             self.assertIn("`owner` 必须是非空字符串", output)
             self.assertIn("`next_min_action` 必须是非空字符串", output)
             self.assertIn("`SEAL_MODE=SEALED_BLOCKED` 时必须提供非空 `due_cycle`", output)
+
+    def test_task_lint_blocks_feature_task_kind_in_non_git_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            gate_line = self._supervisor_dispatch_gate_line({"TASK_KIND": "FEATURE"})
+            self._write_task_with_worker_end_state(workspace, self._worker_end_state_line(), gate_line=gate_line)
+
+            output_buffer = io.StringIO()
+            with redirect_stdout(output_buffer):
+                rc = cli.main(["task", "lint", str(workspace)])
+            output = output_buffer.getvalue()
+
+            self.assertEqual(rc, 1)
+            self.assertIn("BLOCKED_SPEC", output)
+            self.assertIn("非 Git 工作区禁止 `TASK_KIND=FEATURE`", output)
+            self.assertIn("[NEXT_STEP]", output)
+
+    def test_task_lint_rejects_forged_commit_files_when_commit_created(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            tracked_file = workspace / "tracked.txt"
+            tracked_file.write_text("v1\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=workspace, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "Centaur Bot"], cwd=workspace, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.email", "centaur@example.com"], cwd=workspace, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "add", "tracked.txt"], cwd=workspace, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=workspace, check=True, capture_output=True, text=True)
+            head_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=workspace, check=True, capture_output=True, text=True
+            ).stdout.strip()
+
+            gate_line = self._supervisor_dispatch_gate_line({"TASK_KIND": "FEATURE", "DISPATCH_DECISION": "ALLOW_FUNCTIONAL"})
+            line = self._worker_end_state_line(
+                {
+                    "COMMIT_CREATED": 1,
+                    "commit_sha": head_sha,
+                    "commit_files": ["wrong.txt"],
+                }
+            )
+            self._write_task_with_worker_end_state(workspace, line, gate_line=gate_line)
+
+            output_buffer = io.StringIO()
+            with redirect_stdout(output_buffer):
+                rc = cli.main(["task", "lint", str(workspace)])
+            output = output_buffer.getvalue()
+
+            self.assertEqual(rc, 1)
+            self.assertIn("BLOCKED_SPEC", output)
+            self.assertIn("`commit_files` 与 `git show --name-only` 不一致", output)
 
 
 if __name__ == "__main__":

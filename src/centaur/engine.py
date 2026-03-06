@@ -55,6 +55,37 @@ TASK_COMPLETION_EVIDENCE_PREFIX = "[CENTAUR_ROLE_COMPLETION] "
 TASK_CONTRACT_PREFIX = "[CENTAUR_TASK_CONTRACT] "
 WORKER_REPORT_HEADER = "### Worker 执行报告"
 WORKER_END_STATE_PREFIX = "[CENTAUR_WORKER_END_STATE] "
+WORKER_END_STATE_REQUIRED_FIELDS = (
+    "PATCH_APPLIED",
+    "COMMIT_CREATED",
+    "CARRYOVER_FILES",
+    "SEAL_MODE",
+    "RELEASE_DECISION",
+)
+SUPERVISOR_DISPATCH_GATE_PREFIX = "[CENTAUR_SUPERVISOR_DISPATCH_GATE] "
+SUPERVISOR_DISPATCH_GATE_REQUIRED_FIELDS = (
+    "STATUS_CMD",
+    "STATUS_RC",
+    "STATUS_HAS_UNSEALED_DIRTY",
+    "TARGET_DIFF_CMD",
+    "TARGET_DIFF_RC",
+    "TARGET_DIFF_HAS_CHANGES",
+    "TASK_KIND",
+    "DISPATCH_DECISION",
+)
+TASK_KIND_FEATURE = "FEATURE"
+TASK_KIND_INIT = "INIT"
+TASK_KIND_DIAGNOSE = "DIAGNOSE"
+TASK_KIND_SEAL_ONLY = "SEAL_ONLY"
+TASK_KINDS = (TASK_KIND_FEATURE, TASK_KIND_INIT, TASK_KIND_DIAGNOSE, TASK_KIND_SEAL_ONLY)
+NON_GIT_ALLOWED_TASK_KINDS = (TASK_KIND_INIT, TASK_KIND_DIAGNOSE, TASK_KIND_SEAL_ONLY)
+SUPERVISOR_DISPATCH_GATE_DECISIONS = ("ALLOW_FUNCTIONAL", "SEAL_ONLY")
+GIT_WORKTREE_PROBE_CMD = "git rev-parse --is-inside-work-tree"
+GIT_STATUS_WORKTREE_CMD = (
+    "git status --porcelain --untracked-files=all -- . "
+    "':(exclude).centaur' ':(exclude).centaur/**'"
+)
+GIT_COMMIT_FILES_CMD_PREFIX = "git show --name-only --pretty=format:"
 SEALED_BLOCKED_MODE = "SEALED_BLOCKED"
 SEALED_BLOCKED_MIN_FIELDS = ("carryover_reason", "owner", "next_min_action", "due_cycle")
 CHECKPOINT_ROLE = "validator"
@@ -94,6 +125,18 @@ class RuntimePolicy:
     human_gate_policy: str
     codex_exec_sandbox: str | None
     codex_exec_dangerously_bypass: bool
+
+
+@dataclass(frozen=True)
+class GitWorktreeSnapshot:
+    is_git: bool
+    probe_return_code: int
+    probe_stdout: str
+    probe_stderr: str
+    status_return_code: int | None
+    status_stdout: str
+    status_stderr: str
+    head_sha: str | None
 
 
 def is_framework_repo_root(workdir: Path) -> bool:
@@ -1143,6 +1186,45 @@ def _git_status_excluding_runtime(workdir: Path) -> subprocess.CompletedProcess[
     )
 
 
+def _capture_git_worktree_snapshot(workdir: Path) -> GitWorktreeSnapshot:
+    probe = _run_git(workdir, ["rev-parse", "--is-inside-work-tree"])
+    probe_stdout = probe.stdout.strip()
+    probe_stderr = probe.stderr.strip()
+    is_git = probe.returncode == 0 and probe_stdout.lower() == "true"
+
+    if not is_git:
+        return GitWorktreeSnapshot(
+            is_git=False,
+            probe_return_code=probe.returncode,
+            probe_stdout=probe_stdout,
+            probe_stderr=probe_stderr,
+            status_return_code=None,
+            status_stdout="",
+            status_stderr="",
+            head_sha=None,
+        )
+
+    status = _git_status_excluding_runtime(workdir)
+    head = _run_git(workdir, ["rev-parse", "HEAD"])
+    head_sha = head.stdout.strip() if head.returncode == 0 and head.stdout.strip() else None
+    return GitWorktreeSnapshot(
+        is_git=True,
+        probe_return_code=probe.returncode,
+        probe_stdout=probe_stdout,
+        probe_stderr=probe_stderr,
+        status_return_code=status.returncode,
+        status_stdout=status.stdout,
+        status_stderr=status.stderr,
+        head_sha=head_sha,
+    )
+
+
+def _snapshot_dirty_lines(snapshot: GitWorktreeSnapshot) -> list[str]:
+    if snapshot.status_return_code != 0:
+        return []
+    return [line.strip() for line in snapshot.status_stdout.splitlines() if line.strip()]
+
+
 def enforce_next_cycle_git_worktree_guard(workdir: Path, next_cycle: int) -> None:
     if not _is_git_workspace(workdir):
         print("ℹ️ 当前工作区不是 Git 仓库，已跳过跨轮次工作树闸门检查。")
@@ -1515,15 +1597,137 @@ def _task_has_completion_evidence(workdir: Path, cycle: int, role: str, run_id: 
     return False
 
 
+def _read_task_lines(task_path: Path) -> tuple[list[str], list[str]]:
+    try:
+        return task_path.read_text(encoding="utf-8").splitlines(), []
+    except OSError as exc:
+        return [], [f"读取 TASK.md 失败: {exc}"]
+
+
+def _normalize_required_string_list(value: Any, field_name: str, errors: list[str], *, allow_empty: bool) -> list[str]:
+    if not isinstance(value, list):
+        errors.append(f"`{field_name}` 必须是字符串数组")
+        return []
+
+    normalized: list[str] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, str) or not item.strip():
+            errors.append(f"`{field_name}[{index}]` 必须是非空字符串")
+            continue
+        normalized.append(item.strip())
+
+    if not allow_empty and not normalized:
+        errors.append(f"`{field_name}` 不能为空")
+    return normalized
+
+
+def _normalize_required_binary(value: Any, field_name: str, errors: list[str]) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value not in (0, 1):
+        errors.append(f"`{field_name}` 必须是 0 或 1")
+        return None
+    return value
+
+
+def _normalize_required_nonempty_string(value: Any, field_name: str, errors: list[str]) -> str:
+    if not isinstance(value, str) or not value.strip():
+        errors.append(f"`{field_name}` 必须是非空字符串")
+        return ""
+    return value.strip()
+
+
+def _normalize_required_nonnegative_int(value: Any, field_name: str, errors: list[str]) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        errors.append(f"`{field_name}` 必须是非负整数")
+        return None
+    return value
+
+
+def _find_latest_supervisor_dispatch_gate_payload(workdir: Path) -> tuple[dict[str, Any] | None, list[str]]:
+    task_path = workdir / "TASK.md"
+    if not task_path.exists():
+        return None, [f"缺少 `{SUPERVISOR_DISPATCH_GATE_PREFIX.strip()}` 派单封板闸门证据"]
+
+    lines, read_errors = _read_task_lines(task_path)
+    if read_errors:
+        return None, read_errors
+
+    for raw_line in reversed(lines):
+        line = raw_line.strip()
+        if not line.startswith(SUPERVISOR_DISPATCH_GATE_PREFIX):
+            continue
+        payload_text = line[len(SUPERVISOR_DISPATCH_GATE_PREFIX) :].strip()
+        try:
+            payload = json.loads(payload_text)
+        except json.JSONDecodeError as exc:
+            return None, [f"`{SUPERVISOR_DISPATCH_GATE_PREFIX.strip()}` JSON 非法: {exc}"]
+        if not isinstance(payload, dict):
+            return None, [f"`{SUPERVISOR_DISPATCH_GATE_PREFIX.strip()}` 载荷必须是 JSON 对象"]
+        return payload, []
+    return None, [f"缺少 `{SUPERVISOR_DISPATCH_GATE_PREFIX.strip()}` 派单封板闸门证据"]
+
+
+def _lint_supervisor_dispatch_gate(workdir: Path, *, required: bool) -> tuple[list[str], list[str], dict[str, Any] | None]:
+    errors: list[str] = []
+    warnings: list[str] = []
+    payload, parse_errors = _find_latest_supervisor_dispatch_gate_payload(workdir)
+    if parse_errors:
+        if required:
+            errors.extend(parse_errors)
+        return errors, warnings, None
+    if payload is None:
+        return errors, warnings, None
+
+    for field_name in SUPERVISOR_DISPATCH_GATE_REQUIRED_FIELDS:
+        if field_name not in payload:
+            errors.append(f"派单封板闸门缺少 `{field_name}`")
+
+    status_cmd = _normalize_required_nonempty_string(payload.get("STATUS_CMD"), "STATUS_CMD", errors)
+    status_rc = _normalize_required_nonnegative_int(payload.get("STATUS_RC"), "STATUS_RC", errors)
+    status_has_unsealed_dirty = _normalize_required_binary(
+        payload.get("STATUS_HAS_UNSEALED_DIRTY"), "STATUS_HAS_UNSEALED_DIRTY", errors
+    )
+    target_diff_cmd = _normalize_required_nonempty_string(payload.get("TARGET_DIFF_CMD"), "TARGET_DIFF_CMD", errors)
+    target_diff_rc = _normalize_required_nonnegative_int(payload.get("TARGET_DIFF_RC"), "TARGET_DIFF_RC", errors)
+    _normalize_required_binary(payload.get("TARGET_DIFF_HAS_CHANGES"), "TARGET_DIFF_HAS_CHANGES", errors)
+    task_kind_raw = _normalize_required_nonempty_string(payload.get("TASK_KIND"), "TASK_KIND", errors)
+    dispatch_decision_raw = _normalize_required_nonempty_string(payload.get("DISPATCH_DECISION"), "DISPATCH_DECISION", errors)
+
+    if status_cmd and "git status --short" not in status_cmd:
+        errors.append("`STATUS_CMD` 必须包含 `git status --short` 证据")
+    if status_rc is not None and status_rc != 0:
+        errors.append("`STATUS_RC` 必须为 0，否则无法确认派单前封板闸门已执行")
+    if target_diff_cmd and "git diff" not in target_diff_cmd:
+        errors.append("`TARGET_DIFF_CMD` 必须包含目标文件 `git diff` 证据")
+    if target_diff_rc is not None and target_diff_rc != 0:
+        errors.append("`TARGET_DIFF_RC` 必须为 0，否则无法确认目标文件 diff 检查已执行")
+
+    task_kind = task_kind_raw.upper()
+    dispatch_decision = dispatch_decision_raw.upper()
+    if task_kind and task_kind not in TASK_KINDS:
+        errors.append(f"`TASK_KIND` 非法，必须是 {TASK_KINDS}")
+    if dispatch_decision and dispatch_decision not in SUPERVISOR_DISPATCH_GATE_DECISIONS:
+        errors.append(f"`DISPATCH_DECISION` 非法，必须是 {SUPERVISOR_DISPATCH_GATE_DECISIONS}")
+
+    if status_has_unsealed_dirty == 1:
+        if dispatch_decision != TASK_KIND_SEAL_ONLY:
+            errors.append("检测到未封板业务脏改时，`DISPATCH_DECISION` 必须为 `SEAL_ONLY`")
+        if task_kind != TASK_KIND_SEAL_ONLY:
+            errors.append("检测到未封板业务脏改时，功能任务必须阻断；仅允许 `TASK_KIND=SEAL_ONLY`")
+
+    normalized_payload = dict(payload)
+    normalized_payload["TASK_KIND"] = task_kind
+    normalized_payload["DISPATCH_DECISION"] = dispatch_decision
+    return errors, warnings, normalized_payload
+
+
 def _find_latest_worker_end_state_payload(workdir: Path) -> tuple[dict[str, Any] | None, list[str], bool]:
     task_path = workdir / "TASK.md"
     if not task_path.exists():
         return None, [], False
 
-    try:
-        lines = task_path.read_text(encoding="utf-8").splitlines()
-    except OSError as exc:
-        return None, [f"读取 TASK.md 失败: {exc}"], False
+    lines, read_errors = _read_task_lines(task_path)
+    if read_errors:
+        return None, read_errors, False
 
     latest_worker_index = -1
     for index, raw_line in enumerate(lines):
@@ -1553,6 +1757,78 @@ def _find_latest_worker_end_state_payload(workdir: Path) -> tuple[dict[str, Any]
     return None, [f"最新 Worker 执行报告缺少 `{WORKER_END_STATE_PREFIX.strip()}` 回填字段"], True
 
 
+def _lint_worker_end_state_payload(
+    workdir: Path, *, require_worker_report: bool
+) -> tuple[list[str], list[str], dict[str, Any] | None, bool]:
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    payload, parse_errors, worker_report_found = _find_latest_worker_end_state_payload(workdir)
+    if parse_errors:
+        return parse_errors, warnings, None, worker_report_found
+    if not worker_report_found:
+        if require_worker_report:
+            errors.append(f"缺少 `{WORKER_REPORT_HEADER}`，无法执行结束态机审")
+        return errors, warnings, None, worker_report_found
+    if payload is None:
+        return errors, warnings, None, worker_report_found
+
+    for field_name in WORKER_END_STATE_REQUIRED_FIELDS:
+        if field_name not in payload:
+            errors.append(f"结束态回填缺少 `{field_name}`")
+
+    patch_applied = _normalize_required_binary(payload.get("PATCH_APPLIED"), "PATCH_APPLIED", errors)
+    commit_created = _normalize_required_binary(payload.get("COMMIT_CREATED"), "COMMIT_CREATED", errors)
+    carryover_files = _normalize_required_string_list(
+        payload.get("CARRYOVER_FILES"), "CARRYOVER_FILES", errors, allow_empty=True
+    )
+    seal_mode = _normalize_required_nonempty_string(payload.get("SEAL_MODE"), "SEAL_MODE", errors)
+    release_decision = _normalize_required_nonempty_string(payload.get("RELEASE_DECISION"), "RELEASE_DECISION", errors)
+
+    commit_sha = ""
+    commit_files: list[str] = []
+    if commit_created == 1:
+        commit_sha = _normalize_required_nonempty_string(payload.get("commit_sha"), "commit_sha", errors)
+        commit_files = _normalize_required_string_list(payload.get("commit_files"), "commit_files", errors, allow_empty=False)
+
+    carryover_reason = ""
+    owner = ""
+    next_min_action = ""
+    due_cycle: int | str | None = None
+    if seal_mode.upper() == SEALED_BLOCKED_MODE:
+        carryover_reason = _normalize_required_nonempty_string(payload.get("carryover_reason"), "carryover_reason", errors)
+        owner = _normalize_required_nonempty_string(payload.get("owner"), "owner", errors)
+        next_min_action = _normalize_required_nonempty_string(payload.get("next_min_action"), "next_min_action", errors)
+        due_cycle_raw = payload.get("due_cycle")
+        if (
+            isinstance(due_cycle_raw, bool)
+            or due_cycle_raw is None
+            or (isinstance(due_cycle_raw, str) and not due_cycle_raw.strip())
+            or (not isinstance(due_cycle_raw, (int, str)))
+        ):
+            errors.append("`SEAL_MODE=SEALED_BLOCKED` 时必须提供非空 `due_cycle`")
+        else:
+            due_cycle = due_cycle_raw.strip() if isinstance(due_cycle_raw, str) else due_cycle_raw
+
+    normalized_payload: dict[str, Any] = {
+        "PATCH_APPLIED": patch_applied,
+        "COMMIT_CREATED": commit_created,
+        "CARRYOVER_FILES": carryover_files,
+        "SEAL_MODE": seal_mode,
+        "RELEASE_DECISION": release_decision,
+    }
+    if commit_created == 1:
+        normalized_payload["commit_sha"] = commit_sha
+        normalized_payload["commit_files"] = commit_files
+    if seal_mode.upper() == SEALED_BLOCKED_MODE:
+        normalized_payload["carryover_reason"] = carryover_reason
+        normalized_payload["owner"] = owner
+        normalized_payload["next_min_action"] = next_min_action
+        normalized_payload["due_cycle"] = due_cycle
+
+    return errors, warnings, normalized_payload, worker_report_found
+
+
 def _is_nonempty_string(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
@@ -1579,8 +1855,14 @@ def _sealed_blocked_missing_fields(payload: dict[str, Any]) -> list[str]:
 
 
 def _validator_hard_reject_reasons(workdir: Path) -> list[str]:
-    payload, _parse_errors, worker_report_found = _find_latest_worker_end_state_payload(workdir)
-    if not worker_report_found or payload is None:
+    parse_errors, _warnings, payload, worker_report_found = _lint_worker_end_state_payload(
+        workdir, require_worker_report=False
+    )
+    if parse_errors:
+        if not worker_report_found:
+            return []
+        return [f"结束态机审失败（Fail-Closed）: {reason}" for reason in parse_errors]
+    if payload is None:
         return []
 
     patch_applied = _coerce_int(payload.get("PATCH_APPLIED"))
@@ -1797,6 +2079,159 @@ def _classify_worker_outcome(workdir: Path, cycle: int, run_id: str) -> tuple[st
     return WORKER_RESULT_SUCCESS, []
 
 
+def _build_worker_machine_proof_evidence(before: GitWorktreeSnapshot, after: GitWorktreeSnapshot) -> list[str]:
+    evidence = [
+        f"[EVIDENCE_CMD] {GIT_WORKTREE_PROBE_CMD}",
+        f"[EVIDENCE_CMD] {GIT_STATUS_WORKTREE_CMD}",
+        (
+            "[EVIDENCE_BEFORE] "
+            f"rev-parse(rc={before.probe_return_code}, stdout={before.probe_stdout or '<empty>'}) "
+            f"head={before.head_sha or '<none>'}"
+        ),
+        (
+            "[EVIDENCE_AFTER] "
+            f"rev-parse(rc={after.probe_return_code}, stdout={after.probe_stdout or '<empty>'}) "
+            f"head={after.head_sha or '<none>'}"
+        ),
+    ]
+    if before.status_return_code is not None:
+        evidence.append(f"[EVIDENCE_BEFORE] status(rc={before.status_return_code})")
+    if after.status_return_code is not None:
+        evidence.append(f"[EVIDENCE_AFTER] status(rc={after.status_return_code})")
+    return evidence
+
+
+def _derive_git_end_state_from_snapshots(
+    before: GitWorktreeSnapshot, after: GitWorktreeSnapshot
+) -> tuple[int | None, int | None, list[str]]:
+    errors: list[str] = []
+    if not after.is_git:
+        return None, None, errors
+
+    if before.status_return_code is not None and before.status_return_code != 0:
+        detail = before.status_stderr.strip() or before.status_stdout.strip() or "unknown"
+        errors.append(f"Worker 前置 Git 状态采样失败: {detail}")
+        return None, None, errors
+    if after.status_return_code is None or after.status_return_code != 0:
+        detail = after.status_stderr.strip() or after.status_stdout.strip() or "unknown"
+        errors.append(f"Worker 后置 Git 状态采样失败: {detail}")
+        return None, None, errors
+
+    before_dirty = set(_snapshot_dirty_lines(before))
+    after_dirty = set(_snapshot_dirty_lines(after))
+    head_changed = bool(after.head_sha) and before.head_sha != after.head_sha
+    dirty_changed = before_dirty != after_dirty
+
+    patch_applied_auto = 1 if (head_changed or dirty_changed) else 0
+    commit_created_auto = 1 if head_changed else 0
+    return patch_applied_auto, commit_created_auto, errors
+
+
+def _verify_declared_commit_metadata(
+    workdir: Path,
+    payload: dict[str, Any],
+    after: GitWorktreeSnapshot,
+    auto_commit_created: int,
+) -> list[str]:
+    errors: list[str] = []
+    if _coerce_int(payload.get("COMMIT_CREATED")) != 1:
+        return errors
+
+    commit_sha = str(payload.get("commit_sha", "")).strip()
+    if not commit_sha:
+        return errors
+
+    verify = _run_git(workdir, ["cat-file", "-e", f"{commit_sha}^{{commit}}"])
+    if verify.returncode != 0:
+        detail = verify.stderr.strip() or verify.stdout.strip() or "unknown"
+        errors.append(f"`commit_sha` 不可达: {commit_sha} ({detail})")
+        return errors
+
+    if auto_commit_created == 1 and after.head_sha and commit_sha != after.head_sha:
+        errors.append(
+            "`COMMIT_CREATED=1` 时 `commit_sha` 必须指向 Worker 结束后的 HEAD，"
+            f"当前回填={commit_sha}, HEAD={after.head_sha}"
+        )
+
+    show = _run_git(workdir, ["show", "--name-only", "--pretty=format:", commit_sha])
+    if show.returncode != 0:
+        detail = show.stderr.strip() or show.stdout.strip() or "unknown"
+        errors.append(f"`commit_files` 校验失败：无法执行 `{GIT_COMMIT_FILES_CMD_PREFIX} {commit_sha}` ({detail})")
+        return errors
+
+    actual_files = sorted({line.strip() for line in show.stdout.splitlines() if line.strip()})
+    declared_files = sorted(
+        {
+            item.strip()
+            for item in payload.get("commit_files", [])
+            if isinstance(item, str) and item.strip()
+        }
+    )
+    if declared_files != actual_files:
+        errors.append(
+            "`commit_files` 与 Git 机证不一致："
+            f"declared={declared_files}, actual={actual_files}, cmd=`{GIT_COMMIT_FILES_CMD_PREFIX} {commit_sha}`"
+        )
+    return errors
+
+
+def _collect_worker_validator_gate_failures(
+    workdir: Path,
+    before: GitWorktreeSnapshot,
+    after: GitWorktreeSnapshot,
+) -> list[str]:
+    failures: list[str] = []
+    contract_errors, _contract_warnings, contract = lint_task_contract(workdir)
+    failures.extend([f"[TASK_CONTRACT] {item}" for item in contract_errors])
+    if contract is None:
+        return failures
+
+    dispatch_errors, _dispatch_warnings, dispatch_payload = _lint_supervisor_dispatch_gate(workdir, required=True)
+    failures.extend([f"[DISPATCH_GATE] {item}" for item in dispatch_errors])
+
+    end_state_errors, _end_state_warnings, payload, _worker_report_found = _lint_worker_end_state_payload(
+        workdir, require_worker_report=True
+    )
+    failures.extend([f"[WORKER_END_STATE] {item}" for item in end_state_errors])
+
+    if failures or dispatch_payload is None or payload is None:
+        return failures
+
+    task_kind = str(dispatch_payload.get("TASK_KIND", "")).strip().upper()
+    if not after.is_git:
+        if task_kind == TASK_KIND_FEATURE:
+            failures.append("非 Git 工作区禁止 `TASK_KIND=FEATURE`，仅允许 `INIT/DIAGNOSE/SEAL_ONLY`。")
+        elif task_kind not in NON_GIT_ALLOWED_TASK_KINDS:
+            failures.append(f"非 Git 工作区 `TASK_KIND` 非法: {task_kind}，仅允许 {NON_GIT_ALLOWED_TASK_KINDS}")
+        if failures:
+            failures.extend(_build_worker_machine_proof_evidence(before, after))
+        return failures
+
+    patch_auto, commit_auto, derive_errors = _derive_git_end_state_from_snapshots(before, after)
+    failures.extend([f"[MACHINE_PROOF] {item}" for item in derive_errors])
+    if patch_auto is None or commit_auto is None:
+        failures.extend(_build_worker_machine_proof_evidence(before, after))
+        return failures
+
+    patch_claim = _coerce_int(payload.get("PATCH_APPLIED"))
+    commit_claim = _coerce_int(payload.get("COMMIT_CREATED"))
+    if patch_claim != patch_auto:
+        failures.append(
+            "结束态回填与 Git 机证不一致："
+            f"PATCH_APPLIED(claim={patch_claim}, auto={patch_auto})"
+        )
+    if commit_claim != commit_auto:
+        failures.append(
+            "结束态回填与 Git 机证不一致："
+            f"COMMIT_CREATED(claim={commit_claim}, auto={commit_auto})"
+        )
+
+    failures.extend(_verify_declared_commit_metadata(workdir, payload, after, commit_auto))
+    if failures:
+        failures.extend(_build_worker_machine_proof_evidence(before, after))
+    return failures
+
+
 def _verify_supervisor_real_completion(workdir: Path, cycle: int, started_at: Any) -> list[str]:
     failures: list[str] = []
     task_path = workdir / "TASK.md"
@@ -1913,6 +2348,28 @@ def _route_worker_non_success_and_stop(
     print(f"   - cycle={cycle}, run_id={run_id}, outcome={outcome}")
     for reason in reasons:
         print(f"   - {reason}")
+    raise SystemExit(1)
+
+
+def _route_worker_contract_gate_and_stop(
+    workdir: Path,
+    state: dict[str, Any],
+    cycle: int,
+    run_id: str,
+    active_task: str,
+    reasons: list[str],
+) -> None:
+    _clear_role_transaction(state)
+    state["cycle"] = cycle
+    state["next_step"] = "supervisor"
+    save_state(workdir, state)
+    sync_task_bus_to_active(workdir, active_task)
+    print("❌ Worker->Validator 强制契约闸门失败，已阻断并回流 Supervisor。")
+    print(f"   - cycle={cycle}, run_id={run_id}")
+    for reason in reasons:
+        print(f"   - {reason}")
+    print("   [NEXT_STEP] centaur task lint")
+    print("   [NEXT_STEP] Supervisor 需先修复 TASK 口径/结束态回填后再放行下一轮。")
     raise SystemExit(1)
 
 
@@ -2350,6 +2807,7 @@ def run_workflow(
             _start_role_transaction(state, role="worker", cycle=cycle)
             save_state(base, state)
             run_id = str(state.get("run_id") or "")
+            worker_git_before = _capture_git_worktree_snapshot(base)
             try:
                 run_agent(
                     "Worker",
@@ -2373,6 +2831,7 @@ def run_workflow(
                         reasons=reasons,
                     )
                 raise
+            worker_git_after = _capture_git_worktree_snapshot(base)
             append_task_completion_evidence(base, cycle=cycle, role="worker", run_id=run_id)
             outcome, reasons = _classify_worker_outcome(base, cycle=cycle, run_id=run_id)
             if outcome != WORKER_RESULT_SUCCESS:
@@ -2384,6 +2843,16 @@ def run_workflow(
                     active_task=active_task,
                     outcome=outcome,
                     reasons=reasons,
+                )
+            worker_gate_failures = _collect_worker_validator_gate_failures(base, worker_git_before, worker_git_after)
+            if worker_gate_failures:
+                _route_worker_contract_gate_and_stop(
+                    workdir=base,
+                    state=state,
+                    cycle=cycle,
+                    run_id=run_id,
+                    active_task=active_task,
+                    reasons=worker_gate_failures,
                 )
             _clear_role_transaction(state)
             state["next_step"] = "validator"
