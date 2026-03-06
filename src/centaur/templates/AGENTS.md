@@ -58,6 +58,7 @@
 3. **回报方式**：Worker 与 Validator 只能在 `TASK.md` 末尾追加报告，不得改写已有内容。
 4. **流程顺序**：`Supervisor -> Human Gate -> Worker -> Validator -> Supervisor`，循环推进。
 5. **人类闸门**：每轮在 Worker 执行前必须经过人工放行或微调任务。
+6. **任务结构默认口径**：`TASK.md` 正文默认采用“任务目标 / 约束边界 / 验收标准”；`执行步骤` 仅可作为高风险场景的可选前置检查说明，非必填字段。
 
 ---
 
@@ -85,3 +86,12 @@
 1. **结构化契约优先**：若 `TASK.md` 存在 `[CENTAUR_TASK_CONTRACT]`，以其机审结果为准。
 2. **冲突优先级**：`forbidden_delta > allowed_delta > wording`。
 3. **结论分流**：契约自冲突命中 `BLOCKED_SPEC`，不得记为 Worker 实现失败。
+
+## 7. 项目规则维护机制 (Rule Maintenance Mechanism)
+
+为保证跨轮次执行一致性，项目规则必须按四层分工维护，并可由文件快照独立审计：
+
+1. **`project.json`（机器规则）**：维护可机读规则及触发动作映射。
+2. **`AGENTS.md`（长期约束）**：维护跨任务长期有效的职责边界、流程纪律与红线口径。
+3. **`TASK.md`（当轮强约束）**：由 Supervisor 在当轮任务中固化规则命中时的触发条件、动作与证据要求。
+4. **`PROJECT_STATUS.md` / `LESSONS.md`（审计沉淀）**：记录规则变更内容、触发场景、验证结论与复盘结果。

@@ -36,21 +36,33 @@
 ## 任务背景
 （简述为什么要做这个任务，以及它在 PLAN.md 中的位置）
 
-## 执行步骤
-1. ...
-2. ...
+## 任务目标
+（一句话说明本轮必须达成的结果）
+
+## 约束边界
+- 仅允许修改：...
+- 禁止修改：...
+- 依赖/环境前置：
+  - 开始编码前执行并记录：`cd <repo_root> && git status --short -- <allowed_delta_files> <forbidden_delta_files>`
+  - 完成修改后再次执行同一条快照命令并记录差异归因。
 
 ## 验收标准
-- [ ] 必须通过的测试或必须没有报错。
-- [ ] 必须创建或修改的具体文件。
+- [ ] ...
+- [ ] ...
 
 ## 机审契约
-`[CENTAUR_TASK_CONTRACT] {"version":1,"unit":"set_exact","baseline":"","allowed_delta":[],"forbidden_delta":[],"precedence":["forbidden","allowed","wording"]}`
+[CENTAUR_TASK_CONTRACT] {"version":1,"unit":"set_exact","baseline":"","allowed_delta":[],"forbidden_delta":[],"precedence":["forbidden","allowed","wording"]}
 
 ---
 ## Worker 反馈区
 **@Worker：请在你的任务结束后，将执行结果、命令行输出或错误日志追加 (Append) 到此分隔线下方。**
 ```
+
+补充约束：
+- 默认派单结构必须是“任务目标 / 约束边界 / 验收标准”。
+- 仅在高风险场景补充必要前置检查（如环境探测、契约冲突检查），不得把逐行实现脚本写入 TASK。
+- 为 Worker/Validator 统一改动归因，默认要求在任务正文中显式提供 `git status --short -- ...`，并写明“开始编码前执行并记录”。
+- 当命中 `project.json` 中已登记的项目规则时，必须在当轮 `TASK.md` 写明三要素：`触发条件 / 动作 / 证据要求`。
 
 ### Step 5: 终端播报与结束 (Terminal Broadcast & Exit)
 完成 `TASK.md` 的覆写后，你必须向终端（标准输出）打印一份标准的【Supervisor 调度总结】，直接回复给人类查看。
