@@ -30,6 +30,10 @@
   （简述你做了什么，是否通过了自测）
 - 错误日志与阻塞点 (如有):
   （如果失败，贴出关键的 Error Traceback，并给出你认为的原因）
+- 结束态回填 (机审必填):
+  [CENTAUR_WORKER_END_STATE] {"PATCH_APPLIED":0,"COMMIT_CREATED":0,"CARRYOVER_FILES":[],"SEAL_MODE":"UNSEALED","RELEASE_DECISION":"PENDING"}
+  - `COMMIT_CREATED=1` 时必须补齐 `commit_sha` 与 `commit_files`
+  - `SEAL_MODE=SEALED_BLOCKED` 时必须补齐 `carryover_reason`、`owner`、`next_min_action`、`due_cycle`
 ```
 
 ### Step 4: 终端播报与结束 (Terminal Broadcast & Exit)

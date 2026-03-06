@@ -5,6 +5,7 @@ from importlib.resources import files
 import subprocess
 import shutil
 import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import sys
 from pathlib import Path
@@ -14,8 +15,9 @@ import uuid
 from centaur import __version__
 
 ROLE_TEMPLATE_FILES = ("AGENTS.md", "SUPERVISOR.md", "WORKER.md", "VALIDATOR.md")
-PROJECT_TEMPLATE_FILES = ("PROPOSAL.md",)
+PROJECT_TEMPLATE_FILES = ("PROPOSAL.md", "PROJECT_STATUS.md", "AGENTS.md")
 CORE_FILES = ROLE_TEMPLATE_FILES
+PROMPT_MODE_INFER_FROZEN_FILES = tuple(name for name in ROLE_TEMPLATE_FILES if name != "AGENTS.md")
 REQUIRED_WORKSPACE_FILES = ("PROPOSAL.md",)
 MEMORY_FILES = ("DESIGN.md", "LESSONS.md", "CODE_MAP.md", "PLAN.md", "PROJECT_STATUS.md")
 ROLE_ORDER = ("supervisor", "human_gate", "worker", "validator")
@@ -36,6 +38,8 @@ CONTROL_DIR = "control"
 CONTROL_TASKS_FILE = "tasks.json"
 SCHEDULER_STATE_FILE = "scheduler_state.json"
 EVENTS_FILE = "events.jsonl"
+RUNTIME_METRICS_FILE = "runtime_metrics.json"
+RUNTIME_METRICS_SCHEMA_VERSION = 1
 DEFAULT_TASK_NAME = "default"
 TASK_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 CONTROL_SCHEMA_VERSION = 1
@@ -69,6 +73,23 @@ TASK_CONTRACT_MODES = (
     TASK_CONTRACT_MODE_ENFORCE,
 )
 TASK_CONTRACT_UNITS = ("text_exact", "set_exact", "set_plus")
+HUMAN_GATE_POLICY_ALWAYS = "always"
+HUMAN_GATE_POLICY_RISK = "risk"
+HUMAN_GATE_POLICY_OFF = "off"
+HUMAN_GATE_POLICIES = (
+    HUMAN_GATE_POLICY_ALWAYS,
+    HUMAN_GATE_POLICY_RISK,
+    HUMAN_GATE_POLICY_OFF,
+)
+CODEX_EXEC_SANDBOX_VALUES = ("read-only", "workspace-write", "danger-full-access")
+DEFAULT_CODEX_EXEC_SANDBOX = "workspace-write"
+
+
+@dataclass(frozen=True)
+class RuntimePolicy:
+    human_gate_policy: str
+    codex_exec_sandbox: str | None
+    codex_exec_dangerously_bypass: bool
 
 
 def is_framework_repo_root(workdir: Path) -> bool:
@@ -133,6 +154,212 @@ def get_events_path(workdir: Path) -> Path:
     return _runtime_dir(workdir) / EVENTS_FILE
 
 
+def get_runtime_metrics_path(workdir: Path) -> Path:
+    return _runtime_dir(workdir) / RUNTIME_METRICS_FILE
+
+
+def _parse_event_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    token = value.strip()
+    if not token:
+        return None
+    try:
+        parsed = datetime.fromisoformat(token)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _round_metric_seconds(value: float) -> float:
+    return round(float(value), 6)
+
+
+def _derive_runtime_metrics(workdir: Path) -> dict[str, Any]:
+    event_path = get_events_path(workdir)
+    if event_path.exists():
+        try:
+            raw_lines = event_path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            raw_lines = []
+    else:
+        raw_lines = []
+
+    line_count = 0
+    recognized_event_count = 0
+    invalid_event_count = 0
+    incomplete_role_duration_count = 0
+    cycles_seen: set[int] = set()
+    successful_cycles: set[int] = set()
+    cycle_starts: dict[int, datetime] = {}
+    cycle_ends: dict[int, datetime] = {}
+    cycle_role_totals: dict[int, dict[str, float]] = {}
+    cycle_role_runs: dict[int, dict[str, int]] = {}
+    open_role_spans: dict[tuple[int, str], datetime] = {}
+
+    for raw_line in raw_lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        line_count += 1
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            invalid_event_count += 1
+            continue
+        if not isinstance(payload, dict):
+            invalid_event_count += 1
+            continue
+
+        cycle = _coerce_int(payload.get("cycle"))
+        if cycle is None or cycle <= 0:
+            invalid_event_count += 1
+            continue
+
+        event_type = str(payload.get("event_type", "")).strip().lower()
+        if event_type not in {"cycle_start", "cycle_end", "role_start", "role_end"}:
+            continue
+
+        recognized_event_count += 1
+        cycles_seen.add(cycle)
+        timestamp = _parse_event_timestamp(payload.get("timestamp"))
+
+        if event_type == "cycle_start":
+            if timestamp is None:
+                continue
+            current = cycle_starts.get(cycle)
+            if current is None or timestamp < current:
+                cycle_starts[cycle] = timestamp
+            continue
+
+        if event_type == "cycle_end":
+            successful_cycles.add(cycle)
+            if timestamp is None:
+                continue
+            current = cycle_ends.get(cycle)
+            if current is None or timestamp > current:
+                cycle_ends[cycle] = timestamp
+            continue
+
+        role = _normalize_role_token(payload.get("role"))
+        if role not in TRANSACTIONAL_ROLES:
+            invalid_event_count += 1
+            continue
+
+        key = (cycle, role)
+        if event_type == "role_start":
+            if timestamp is None:
+                incomplete_role_duration_count += 1
+                continue
+            if key in open_role_spans:
+                incomplete_role_duration_count += 1
+            open_role_spans[key] = timestamp
+            continue
+
+        if timestamp is None:
+            incomplete_role_duration_count += 1
+            continue
+        start_ts = open_role_spans.pop(key, None)
+        if start_ts is None:
+            incomplete_role_duration_count += 1
+            continue
+        duration_seconds = (timestamp - start_ts).total_seconds()
+        if duration_seconds < 0:
+            incomplete_role_duration_count += 1
+            continue
+
+        role_totals = cycle_role_totals.setdefault(cycle, {})
+        role_runs = cycle_role_runs.setdefault(cycle, {})
+        role_totals[role] = role_totals.get(role, 0.0) + duration_seconds
+        role_runs[role] = role_runs.get(role, 0) + 1
+
+    incomplete_role_duration_count += len(open_role_spans)
+
+    cycles_payload: list[dict[str, Any]] = []
+    incomplete_cycle_duration_count = 0
+    role_totals_all: dict[str, float] = {}
+    role_runs_all: dict[str, int] = {}
+
+    for cycle in sorted(cycles_seen):
+        start_ts = cycle_starts.get(cycle)
+        end_ts = cycle_ends.get(cycle)
+        duration_seconds: float | None = None
+        if start_ts is not None and end_ts is not None:
+            delta_seconds = (end_ts - start_ts).total_seconds()
+            if delta_seconds >= 0:
+                duration_seconds = _round_metric_seconds(delta_seconds)
+        if duration_seconds is None:
+            incomplete_cycle_duration_count += 1
+
+        role_payload: dict[str, Any] = {}
+        cycle_totals = cycle_role_totals.get(cycle, {})
+        cycle_runs = cycle_role_runs.get(cycle, {})
+        for role in sorted(cycle_totals):
+            total_seconds = cycle_totals[role]
+            runs = cycle_runs.get(role, 0)
+            role_totals_all[role] = role_totals_all.get(role, 0.0) + total_seconds
+            role_runs_all[role] = role_runs_all.get(role, 0) + runs
+            role_payload[role] = {
+                "total_seconds": _round_metric_seconds(total_seconds),
+                "runs": runs,
+                "avg_seconds": _round_metric_seconds(total_seconds / runs) if runs > 0 else None,
+            }
+
+        cycles_payload.append(
+            {
+                "cycle": cycle,
+                "status": "passed" if cycle in successful_cycles else "incomplete",
+                "duration_seconds": duration_seconds,
+                "role_durations": role_payload,
+            }
+        )
+
+    role_durations_payload: dict[str, Any] = {}
+    for role in sorted(role_totals_all):
+        total_seconds = role_totals_all[role]
+        runs = role_runs_all[role]
+        role_durations_payload[role] = {
+            "total_seconds": _round_metric_seconds(total_seconds),
+            "runs": runs,
+            "avg_seconds": _round_metric_seconds(total_seconds / runs) if runs > 0 else None,
+        }
+
+    total_cycles = len(cycles_seen)
+    successful_cycle_count = len(successful_cycles)
+    pass_rate = _round_metric_seconds(successful_cycle_count / total_cycles) if total_cycles > 0 else None
+
+    return {
+        "schema_version": RUNTIME_METRICS_SCHEMA_VERSION,
+        "generated_at": _iso_utc_now(),
+        "source": f"{RUNTIME_DIR}/{EVENTS_FILE}",
+        "summary": {
+            "event_line_count": line_count,
+            "recognized_event_count": recognized_event_count,
+            "invalid_event_count": invalid_event_count,
+            "incomplete_cycle_duration_count": incomplete_cycle_duration_count,
+            "incomplete_role_duration_count": incomplete_role_duration_count,
+            "total_cycles": total_cycles,
+            "successful_cycles": successful_cycle_count,
+            "pass_rate": pass_rate,
+        },
+        "cycles": cycles_payload,
+        "role_durations": role_durations_payload,
+    }
+
+
+def refresh_runtime_metrics(workdir: Path) -> None:
+    metrics_path = get_runtime_metrics_path(workdir)
+    tmp_path = metrics_path.with_name(f"{metrics_path.name}.tmp")
+    content = json.dumps(_derive_runtime_metrics(workdir), ensure_ascii=False, indent=2) + "\n"
+    try:
+        tmp_path.write_text(content, encoding="utf-8")
+        tmp_path.replace(metrics_path)
+    except OSError as exc:
+        print(f"[⚠️] 写入运行统计失败: {exc}")
+
+
 def append_event(
     workdir: Path,
     cycle: int,
@@ -161,6 +388,10 @@ def append_event(
             f"请检查目录权限与磁盘空间，确保 `{event_path.parent}` 可写。"
         )
         raise SystemExit(1)
+    try:
+        refresh_runtime_metrics(workdir)
+    except Exception as exc:  # pragma: no cover - defensive fallback
+        print(f"[⚠️] 刷新运行统计失败: {exc}")
 
 
 def _write_role_execution_log(
@@ -202,6 +433,7 @@ def run_agent(
     prompt_mode: str,
     cycle: int = 0,
     headless: bool = False,
+    headless_exec_args: list[str] | None = None,
 ) -> None:
     try:
         prompt_content, source = resolve_prompt_content(workdir, prompt_filename, prompt_mode)
@@ -217,7 +449,11 @@ def run_agent(
 
     execution_mode = "headless" if headless else "interactive"
     print(f"\n[🚀] 正在唤醒 {role}... (提示词来源: {source})")
-    command = ["codex", "exec", "--full-auto", prompt_content] if headless else ["codex", "--full-auto", prompt_content]
+    if headless:
+        exec_args = list(headless_exec_args or [])
+        command = ["codex", "exec", "--full-auto", *exec_args, prompt_content]
+    else:
+        command = ["codex", "--full-auto", prompt_content]
     start_time = _iso_utc_now()
     end_time = start_time
     return_code = 1
@@ -327,7 +563,7 @@ def _legacy_project_path(workdir: Path) -> Path:
 
 
 def infer_prompt_mode_from_workspace(workdir: Path) -> str:
-    if any((workdir / name).exists() for name in ROLE_TEMPLATE_FILES):
+    if any((workdir / name).exists() for name in PROMPT_MODE_INFER_FROZEN_FILES):
         return PROMPT_MODE_FROZEN
     return PROMPT_MODE_GLOBAL
 
@@ -495,6 +731,9 @@ def default_project_config(prompt_mode: str | None = None) -> dict[str, Any]:
         "target_ref": "main",
         "target_version": "",
         "task_contract_mode": TASK_CONTRACT_MODE_ENFORCE,
+        "human_gate_policy": HUMAN_GATE_POLICY_ALWAYS,
+        "codex_exec_sandbox": None,
+        "codex_exec_dangerously_bypass": False,
     }
 
 
@@ -539,6 +778,10 @@ def _normalize_project_config(raw: dict[str, Any], fallback_mode: str) -> dict[s
     if task_contract_mode not in TASK_CONTRACT_MODES:
         task_contract_mode = TASK_CONTRACT_MODE_ENFORCE
 
+    human_gate_policy = raw.get("human_gate_policy", HUMAN_GATE_POLICY_ALWAYS)
+    codex_exec_sandbox = raw["codex_exec_sandbox"] if "codex_exec_sandbox" in raw else None
+    codex_exec_dangerously_bypass = raw.get("codex_exec_dangerously_bypass", False)
+
     return {
         "schema_version": PROJECT_SCHEMA_VERSION,
         "centaur_version": centaur_version,
@@ -550,6 +793,9 @@ def _normalize_project_config(raw: dict[str, Any], fallback_mode: str) -> dict[s
         "target_ref": target_ref,
         "target_version": target_version,
         "task_contract_mode": task_contract_mode,
+        "human_gate_policy": human_gate_policy,
+        "codex_exec_sandbox": codex_exec_sandbox,
+        "codex_exec_dangerously_bypass": codex_exec_dangerously_bypass,
     }
 
 
@@ -633,6 +879,103 @@ def collect_prompt_mode_issues(workdir: Path, prompt_mode: str) -> tuple[list[st
 
 def codex_available() -> bool:
     return shutil.which("codex") is not None
+
+
+def _emit_runtime_config_error(reason: str, next_step: str) -> None:
+    print(f"[RUNTIME_CONFIG_ERROR] {reason}")
+    print(f"[NEXT_STEP] {next_step}")
+
+
+def _normalize_policy_token(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    token = value.strip().lower()
+    return token if token else None
+
+
+def parse_runtime_policy(config: dict[str, Any]) -> RuntimePolicy:
+    errors: list[str] = []
+
+    policy_token = _normalize_policy_token(config.get("human_gate_policy", HUMAN_GATE_POLICY_ALWAYS))
+    if policy_token is None or policy_token not in HUMAN_GATE_POLICIES:
+        errors.append(
+            "`human_gate_policy` 非法，必须是 "
+            f"{HUMAN_GATE_POLICIES} 之一，当前值={config.get('human_gate_policy')!r}"
+        )
+        policy_token = HUMAN_GATE_POLICY_ALWAYS
+
+    raw_sandbox = config.get("codex_exec_sandbox")
+    if raw_sandbox is None:
+        sandbox_token: str | None = None
+    elif isinstance(raw_sandbox, str) and raw_sandbox.strip():
+        sandbox_token = raw_sandbox.strip().lower()
+        if sandbox_token not in CODEX_EXEC_SANDBOX_VALUES:
+            errors.append(
+                "`codex_exec_sandbox` 非法，必须是 "
+                f"{CODEX_EXEC_SANDBOX_VALUES} 之一，当前值={raw_sandbox!r}"
+            )
+    else:
+        sandbox_token = None
+        errors.append(f"`codex_exec_sandbox` 非法，必须是字符串或 null，当前值={raw_sandbox!r}")
+
+    raw_bypass = config.get("codex_exec_dangerously_bypass", False)
+    if isinstance(raw_bypass, bool):
+        bypass_enabled = raw_bypass
+    else:
+        bypass_enabled = False
+        errors.append(
+            "`codex_exec_dangerously_bypass` 非法，必须是布尔值，"
+            f"当前值={raw_bypass!r}"
+        )
+
+    if bypass_enabled and sandbox_token is not None:
+        errors.append(
+            "`codex_exec_dangerously_bypass=true` 时禁止显式设置 `codex_exec_sandbox`，"
+            "请删除 sandbox 或关闭 bypass"
+        )
+
+    if errors:
+        raise ValueError("; ".join(errors))
+
+    return RuntimePolicy(
+        human_gate_policy=policy_token,
+        codex_exec_sandbox=sandbox_token,
+        codex_exec_dangerously_bypass=bypass_enabled,
+    )
+
+
+def resolve_runtime_policy_or_exit(config: dict[str, Any]) -> RuntimePolicy:
+    try:
+        return parse_runtime_policy(config)
+    except ValueError as exc:
+        _emit_runtime_config_error(
+            str(exc),
+            "请修复 .centaur/project.json 中的运行策略配置后重试，可先执行 `centaur doctor` 预检。",
+        )
+        raise SystemExit(1)
+
+
+def build_codex_exec_permission_args(policy: RuntimePolicy) -> list[str]:
+    if policy.codex_exec_dangerously_bypass:
+        return ["--dangerously-bypass-approvals-and-sandbox"]
+
+    sandbox = policy.codex_exec_sandbox or DEFAULT_CODEX_EXEC_SANDBOX
+    return ["--sandbox", sandbox]
+
+
+def format_runtime_policy_audit(policy: RuntimePolicy) -> str:
+    if policy.codex_exec_dangerously_bypass:
+        exec_mode = "dangerously-bypass-approvals-and-sandbox"
+    else:
+        exec_mode = f"sandbox={policy.codex_exec_sandbox or DEFAULT_CODEX_EXEC_SANDBOX}"
+    return f"human_gate_policy={policy.human_gate_policy}, codex_exec={exec_mode}"
+
+
+def _normalize_task_contract_mode(value: Any) -> str:
+    token = str(value).strip().lower()
+    if token in TASK_CONTRACT_MODES:
+        return token
+    return TASK_CONTRACT_MODE_ENFORCE
 
 
 def _build_state(cycle: int, next_step: str) -> dict[str, Any]:
@@ -1360,21 +1703,6 @@ def _classify_worker_outcome(workdir: Path, cycle: int, run_id: str) -> tuple[st
     return WORKER_RESULT_SUCCESS, []
 
 
-def _parse_started_at_utc(value: Any) -> datetime | None:
-    if not isinstance(value, str):
-        return None
-    token = value.strip()
-    if not token:
-        return None
-    try:
-        parsed = datetime.fromisoformat(token)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
-
-
 def _verify_supervisor_real_completion(workdir: Path, cycle: int, started_at: Any) -> list[str]:
     failures: list[str] = []
     task_path = workdir / "TASK.md"
@@ -1394,7 +1722,7 @@ def _verify_supervisor_real_completion(workdir: Path, cycle: int, started_at: An
             "真实完成闸门失败：TASK.md 缺少 Supervisor 派单结构字段: " + ", ".join(missing_sections)
         )
 
-    started_at_dt = _parse_started_at_utc(started_at)
+    started_at_dt = _parse_event_timestamp(started_at)
     if started_at_dt is None:
         failures.append(
             "真实完成闸门失败：缺少有效 `started_at`，无法确认 TASK.md 是否在本次 Supervisor 执行窗口内更新。"
@@ -1407,10 +1735,11 @@ def _verify_supervisor_real_completion(workdir: Path, cycle: int, started_at: An
         failures.append(f"真实完成闸门失败：读取 TASK.md 修改时间失败: {exc}")
         return failures
 
+    # 允许 1 秒容差，兼容低精度文件系统时间戳。
     if task_mtime.timestamp() < started_at_dt.timestamp() - 1.0:
         failures.append(
             "真实完成闸门失败：TASK.md 未在本次 Supervisor 执行窗口内更新 "
-            f"(cycle={cycle}, task_mtime={task_mtime.isoformat()}, started_at={started_at_dt.isoformat()})"
+            f"(task_mtime={task_mtime.isoformat()}, started_at={started_at_dt.isoformat()})"
         )
     return failures
 
@@ -1522,6 +1851,12 @@ def migrate_schema(workdir: Path) -> dict[str, Any]:
         config["target_version"] = ""
     if config.get("task_contract_mode") not in TASK_CONTRACT_MODES:
         config["task_contract_mode"] = TASK_CONTRACT_MODE_ENFORCE
+    if "human_gate_policy" not in config:
+        config["human_gate_policy"] = HUMAN_GATE_POLICY_ALWAYS
+    if "codex_exec_sandbox" not in config:
+        config["codex_exec_sandbox"] = None
+    if "codex_exec_dangerously_bypass" not in config:
+        config["codex_exec_dangerously_bypass"] = False
     save_project_config(workdir, config)
     return config
 
@@ -1634,6 +1969,102 @@ def _ensure_supervisor_bootstrap(workdir: Path, state: dict[str, Any]) -> dict[s
     return _default_state()
 
 
+def _load_runtime_settings(
+    workdir: Path,
+) -> tuple[dict[str, Any], str, str, str, RuntimePolicy]:
+    project_config = load_or_init_project_config(workdir)
+    active_task, _ = ensure_active_task_file(workdir, project_config)
+    prompt_mode = str(project_config.get("prompt_mode", PROMPT_MODE_GLOBAL))
+    task_contract_mode = _normalize_task_contract_mode(project_config.get("task_contract_mode"))
+    validate_prompt_mode_env(workdir, prompt_mode)
+    runtime_policy = resolve_runtime_policy_or_exit(project_config)
+    return project_config, active_task, prompt_mode, task_contract_mode, runtime_policy
+
+
+def _git_dirtiness_signal(workdir: Path) -> tuple[bool, str]:
+    if not _is_git_workspace(workdir):
+        return False, "git=non-repo"
+    status = _git_status_excluding_runtime(workdir)
+    if status.returncode != 0:
+        detail = (status.stderr or status.stdout).strip() or "unknown"
+        return True, f"git=status-error:{detail}"
+    dirty_lines = [line for line in status.stdout.splitlines() if line.strip()]
+    if dirty_lines:
+        return True, f"git=dirty(count={len(dirty_lines)})"
+    return False, "git=clean"
+
+
+def _audit_human_gate_decision(cycle: int, policy: str, decision: str, evidence: list[str]) -> None:
+    print(f"[AUDIT] human_gate cycle={cycle} policy={policy} decision={decision}")
+    if not evidence:
+        print("   [EVIDENCE] none")
+        return
+    for item in evidence:
+        print(f"   [EVIDENCE] {item}")
+
+
+def _evaluate_risk_policy(workdir: Path, task_contract_mode: str) -> tuple[bool, list[str]]:
+    triggers: list[str] = []
+    auto_pass: list[str] = []
+
+    dirty, git_signal = _git_dirtiness_signal(workdir)
+    if dirty:
+        triggers.append(f"trigger:{git_signal}")
+    else:
+        auto_pass.append(f"auto-pass:{git_signal}")
+
+    if task_contract_mode != TASK_CONTRACT_MODE_OFF:
+        contract_errors, contract_warnings, _contract = lint_task_contract(workdir)
+        if contract_errors:
+            triggers.append(f"trigger:task_contract_conflict(count={len(contract_errors)})")
+        else:
+            auto_pass.append("auto-pass:task_contract_clean")
+        for warning in contract_warnings:
+            auto_pass.append(f"auto-pass:task_contract_warning={warning}")
+    else:
+        auto_pass.append("auto-pass:task_contract_mode=off")
+
+    if triggers:
+        return True, triggers
+    return False, auto_pass or ["auto-pass:no_risk_signal"]
+
+
+def _evaluate_off_policy(
+    workdir: Path,
+    state: dict[str, Any],
+    task_contract_mode: str,
+) -> tuple[bool, list[str], list[str]]:
+    passed: list[str] = []
+    blockers: list[str] = []
+
+    if state.get("inflight_role") is None:
+        passed.append("check:transaction_clean")
+    else:
+        blockers.append("check_failed:transaction_inflight")
+
+    if codex_available():
+        passed.append("check:codex_available")
+    else:
+        blockers.append("check_failed:codex_unavailable")
+
+    dirty, git_signal = _git_dirtiness_signal(workdir)
+    if dirty:
+        blockers.append(f"check_failed:{git_signal}")
+    else:
+        passed.append(f"check:{git_signal}")
+
+    if task_contract_mode != TASK_CONTRACT_MODE_OFF:
+        contract_errors, _contract_warnings, _contract = lint_task_contract(workdir)
+        if contract_errors:
+            blockers.append(f"check_failed:task_contract_conflict(count={len(contract_errors)})")
+        else:
+            passed.append("check:task_contract_clean")
+    else:
+        passed.append("check:task_contract_mode=off")
+
+    return len(blockers) == 0, passed, blockers
+
+
 def has_interactive_tty() -> bool:
     return bool(sys.stdin.isatty() and sys.stdout.isatty())
 
@@ -1650,13 +2081,7 @@ def run_workflow(
     enforce_workspace_guard(base, allow_repo_root=allow_repo_root)
     check_env(base)
     init_memory_files(base)
-    project_config = load_or_init_project_config(base)
-    active_task, _ = ensure_active_task_file(base, project_config)
-    prompt_mode = str(project_config.get("prompt_mode", PROMPT_MODE_GLOBAL))
-    task_contract_mode = str(project_config.get("task_contract_mode", TASK_CONTRACT_MODE_ENFORCE))
-    if task_contract_mode not in TASK_CONTRACT_MODES:
-        task_contract_mode = TASK_CONTRACT_MODE_ENFORCE
-    validate_prompt_mode_env(base, prompt_mode)
+    _project_config, active_task, prompt_mode, task_contract_mode, runtime_policy = _load_runtime_settings(base)
     if not headless and not has_interactive_tty():
         print("❌ 当前会话不是交互终端（TTY），默认模式无法运行。")
         print("👉 请在真实终端运行 `centaur run`，或显式使用 `centaur run --headless`。")
@@ -1672,11 +2097,14 @@ def run_workflow(
     sync_task_bus_to_active(base, active_task)
     print(f"🧭 Prompt 模式: {prompt_mode}")
     print(f"📐 TASK 契约模式: {task_contract_mode}")
+    print(f"🔐 运行策略: {format_runtime_policy_audit(runtime_policy)}")
     print(f"🧷 当前任务: {active_task}")
     print(f"♻️ 自动恢复状态：第 {state['cycle']} 轮，下一角色 {ROLE_LABELS[state['next_step']]}")
 
     active_cycle: int | None = None
     while True:
+        _project_config, active_task, prompt_mode, task_contract_mode, runtime_policy = _load_runtime_settings(base)
+        headless_exec_args = build_codex_exec_permission_args(runtime_policy) if headless else None
         cycle = int(state["cycle"])
         next_step = str(state["next_step"])
         if active_cycle != cycle:
@@ -1685,6 +2113,7 @@ def run_workflow(
 
         print(f"\n{'█' * 60}")
         print(f"🔄 第 {cycle} 轮开发周期 | 当前阶段: {ROLE_LABELS[next_step]}")
+        print(f"🔐 运行策略: {format_runtime_policy_audit(runtime_policy)}")
         print("█" * 60)
 
         if next_step == "supervisor":
@@ -1694,7 +2123,15 @@ def run_workflow(
             save_state(base, state)
             run_id = str(state.get("run_id") or "")
             started_at = state.get("started_at")
-            run_agent("Supervisor", "SUPERVISOR.md", base, prompt_mode, cycle=cycle, headless=headless)
+            run_agent(
+                "Supervisor",
+                "SUPERVISOR.md",
+                base,
+                prompt_mode,
+                cycle=cycle,
+                headless=headless,
+                headless_exec_args=headless_exec_args,
+            )
             completion_failures = _verify_supervisor_real_completion(
                 base,
                 cycle=cycle,
@@ -1729,7 +2166,45 @@ def run_workflow(
             continue
 
         if next_step == "human_gate":
-            human_gate()
+            if runtime_policy.human_gate_policy == HUMAN_GATE_POLICY_ALWAYS:
+                _audit_human_gate_decision(
+                    cycle=cycle,
+                    policy=runtime_policy.human_gate_policy,
+                    decision="enter_gate",
+                    evidence=["trigger:policy=always"],
+                )
+                human_gate()
+            elif runtime_policy.human_gate_policy == HUMAN_GATE_POLICY_RISK:
+                should_gate, evidence = _evaluate_risk_policy(base, task_contract_mode)
+                _audit_human_gate_decision(
+                    cycle=cycle,
+                    policy=runtime_policy.human_gate_policy,
+                    decision="enter_gate" if should_gate else "auto_pass",
+                    evidence=evidence,
+                )
+                if should_gate:
+                    human_gate()
+                else:
+                    print("🟢 risk 模式信号全部通过，自动放行 Worker。")
+            else:
+                safe_to_skip, passed_checks, blockers = _evaluate_off_policy(base, state, task_contract_mode)
+                if safe_to_skip:
+                    _audit_human_gate_decision(
+                        cycle=cycle,
+                        policy=runtime_policy.human_gate_policy,
+                        decision="skip_gate",
+                        evidence=passed_checks,
+                    )
+                    print("🟢 off 模式前置安全条件满足，已跳过 Human Gate。")
+                else:
+                    _audit_human_gate_decision(
+                        cycle=cycle,
+                        policy=runtime_policy.human_gate_policy,
+                        decision="enter_gate_fail_closed",
+                        evidence=blockers + passed_checks,
+                    )
+                    print("⚠️ off 模式前置安全条件不满足，已回退进入 Human Gate（Fail-Closed）。")
+                    human_gate()
             state["next_step"] = "worker"
             save_state(base, state)
             sync_task_bus_to_active(base, active_task)
@@ -1757,7 +2232,15 @@ def run_workflow(
             save_state(base, state)
             run_id = str(state.get("run_id") or "")
             try:
-                run_agent("Worker", "WORKER.md", base, prompt_mode, cycle=cycle, headless=headless)
+                run_agent(
+                    "Worker",
+                    "WORKER.md",
+                    base,
+                    prompt_mode,
+                    cycle=cycle,
+                    headless=headless,
+                    headless_exec_args=headless_exec_args,
+                )
             except SystemExit:
                 outcome, reasons = _classify_worker_outcome(base, cycle=cycle, run_id=run_id)
                 if outcome in {WORKER_RESULT_FAILED, WORKER_RESULT_BLOCKED}:
@@ -1793,7 +2276,15 @@ def run_workflow(
         _start_role_transaction(state, role="validator", cycle=cycle)
         save_state(base, state)
         run_id = str(state.get("run_id") or "")
-        run_agent("Validator", "VALIDATOR.md", base, prompt_mode, cycle=cycle, headless=headless)
+        run_agent(
+            "Validator",
+            "VALIDATOR.md",
+            base,
+            prompt_mode,
+            cycle=cycle,
+            headless=headless,
+            headless_exec_args=headless_exec_args,
+        )
         append_task_completion_evidence(base, cycle=cycle, role="validator", run_id=run_id)
         gate_failures = _verify_role_dual_gate(base, cycle=cycle, role="validator", run_id=run_id)
         if gate_failures:

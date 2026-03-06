@@ -45,6 +45,12 @@
 - 依赖/环境前置：
   - 开始编码前执行并记录：`cd <repo_root> && git status --short -- <allowed_delta_files> <forbidden_delta_files>`
   - 完成修改后再次执行同一条快照命令并记录差异归因。
+  - 派单前封板闸门（必填）：
+    - 执行并记录：`cd <repo_root> && git status --short -- <business_delta_files>`
+    - 执行并记录：`cd <repo_root> && git diff --name-only -- <target_dispatch_files>`
+    - 在 `TASK.md` 写入单行结构化证据（供 `centaur task lint` 机审）：
+      [CENTAUR_SUPERVISOR_DISPATCH_GATE] {"STATUS_CMD":"cd <repo_root> && git status --short -- <business_delta_files>","STATUS_RC":0,"STATUS_HAS_UNSEALED_DIRTY":0,"TARGET_DIFF_CMD":"cd <repo_root> && git diff --name-only -- <target_dispatch_files>","TARGET_DIFF_RC":0,"TARGET_DIFF_HAS_CHANGES":0,"TASK_KIND":"FEATURE","DISPATCH_DECISION":"ALLOW_FUNCTIONAL"}
+    - 若 `STATUS_HAS_UNSEALED_DIRTY=1`：必须设置 `TASK_KIND=SEAL_ONLY` 与 `DISPATCH_DECISION=SEAL_ONLY`，禁止派发下一功能任务。
 
 ## 验收标准
 - [ ] ...
@@ -56,13 +62,20 @@
 ---
 ## Worker 反馈区
 **@Worker：请在你的任务结束后，将执行结果、命令行输出或错误日志追加 (Append) 到此分隔线下方。**
+- Worker 必填结束态回填（单行 JSON，供 `centaur task lint` 机审）：
+  [CENTAUR_WORKER_END_STATE] {"PATCH_APPLIED":0,"COMMIT_CREATED":0,"CARRYOVER_FILES":[],"SEAL_MODE":"UNSEALED","RELEASE_DECISION":"PENDING"}
+- 条件字段要求：
+  - `COMMIT_CREATED=1` 时必须补齐 `commit_sha` 与 `commit_files`
+  - `SEAL_MODE=SEALED_BLOCKED` 时必须补齐 `carryover_reason`、`owner`、`next_min_action`、`due_cycle`
 ```
 
 补充约束：
 - 默认派单结构必须是“任务目标 / 约束边界 / 验收标准”。
 - 仅在高风险场景补充必要前置检查（如环境探测、契约冲突检查），不得把逐行实现脚本写入 TASK。
 - 为 Worker/Validator 统一改动归因，默认要求在任务正文中显式提供 `git status --short -- ...`，并写明“开始编码前执行并记录”。
+- 派单前必须完成封板闸门：`git status --short` + 目标文件 `git diff` 证据齐全，且当存在未封板业务脏改时仅允许 `SEAL_ONLY` 放行路径。
 - 当命中 `project.json` 中已登记的项目规则时，必须在当轮 `TASK.md` 写明三要素：`触发条件 / 动作 / 证据要求`。
+- Worker 反馈区必须明确要求回填 `PATCH_APPLIED`、`COMMIT_CREATED`、`CARRYOVER_FILES`、`SEAL_MODE`、`RELEASE_DECISION` 五个结束态字段。
 
 ### Step 5: 终端播报与结束 (Terminal Broadcast & Exit)
 完成 `TASK.md` 的覆写后，你必须向终端（标准输出）打印一份标准的【Supervisor 调度总结】，直接回复给人类查看。

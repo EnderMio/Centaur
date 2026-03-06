@@ -2,6 +2,7 @@ from contextlib import redirect_stdout
 import argparse
 from importlib.resources import files
 import io
+import json
 import os
 import tempfile
 import unittest
@@ -260,7 +261,18 @@ class InitTemplateRegressionTests(unittest.TestCase):
             self.assertNotIn("## 执行步骤", supervisor_template)
             self.assertIn("默认派单结构必须是“任务目标 / 约束边界 / 验收标准”", supervisor_template)
             self.assertIn("git status --short --", supervisor_template)
+            self.assertIn("git diff --name-only --", supervisor_template)
             self.assertIn("开始编码前执行并记录", supervisor_template)
+            self.assertIn("[CENTAUR_SUPERVISOR_DISPATCH_GATE]", supervisor_template)
+            self.assertIn("TASK_KIND", supervisor_template)
+            self.assertIn("DISPATCH_DECISION", supervisor_template)
+            self.assertIn("SEAL_ONLY", supervisor_template)
+            self.assertIn("[CENTAUR_WORKER_END_STATE]", supervisor_template)
+            self.assertIn("PATCH_APPLIED", supervisor_template)
+            self.assertIn("COMMIT_CREATED", supervisor_template)
+            self.assertIn("CARRYOVER_FILES", supervisor_template)
+            self.assertIn("SEAL_MODE", supervisor_template)
+            self.assertIn("RELEASE_DECISION", supervisor_template)
 
     def test_init_freeze_prompts_writes_rule_maintenance_mechanism_and_role_guidance(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -291,11 +303,17 @@ class InitTemplateRegressionTests(unittest.TestCase):
             self.assertIn("若命中 `TASK.md` 已声明的项目规则", worker_template)
             self.assertIn("首次失败证据", worker_template)
             self.assertIn("对应动作", worker_template)
+            self.assertIn("[CENTAUR_WORKER_END_STATE]", worker_template)
+            self.assertIn("COMMIT_CREATED=1", worker_template)
+            self.assertIn("SEAL_MODE=SEALED_BLOCKED", worker_template)
             self.assertNotIn("共享内存权限错误需提权重跑", worker_template)
 
             validator_template = (workspace / "VALIDATOR.md").read_text(encoding="utf-8")
             self.assertIn("首次失败与后续执行双证据闭环", validator_template)
             self.assertIn("不得仅凭口头描述放行", validator_template)
+            self.assertIn("[CENTAUR_SUPERVISOR_DISPATCH_GATE]", validator_template)
+            self.assertIn("SEAL_ONLY", validator_template)
+            self.assertIn("[CENTAUR_WORKER_END_STATE]", validator_template)
             self.assertNotIn("共享内存权限错误需提权重跑", validator_template)
 
             project_status_template = (workspace / "PROJECT_STATUS.md").read_text(encoding="utf-8")
@@ -321,8 +339,14 @@ class InitTemplateRegressionTests(unittest.TestCase):
             self.assertIn(f"\n{contract_line}\n", supervisor_template)
             self.assertNotIn(f"`{contract_line}`", supervisor_template)
 
+            dispatch_gate_line = (
+                '[CENTAUR_SUPERVISOR_DISPATCH_GATE] '
+                '{"STATUS_CMD":"cd /repo && git status --short -- src/centaur/cli.py","STATUS_RC":0,"STATUS_HAS_UNSEALED_DIRTY":0,'
+                '"TARGET_DIFF_CMD":"cd /repo && git diff --name-only -- src/centaur/cli.py","TARGET_DIFF_RC":0,'
+                '"TARGET_DIFF_HAS_CHANGES":0,"TASK_KIND":"FEATURE","DISPATCH_DECISION":"ALLOW_FUNCTIONAL"}'
+            )
             (workspace / "TASK.md").write_text(
-                f"# 当前任务 (Task)\n\n## 机审契约\n{contract_line}\n",
+                f"# 当前任务 (Task)\n\n## 机审契约\n{contract_line}\n{dispatch_gate_line}\n",
                 encoding="utf-8",
             )
             lint_output_buffer = io.StringIO()
@@ -401,16 +425,71 @@ class RunCommandGuardrailTests(unittest.TestCase):
 
 
 class TaskContractLintTests(unittest.TestCase):
-    def test_task_lint_normalizes_task_md_file_path_argument(self) -> None:
-        contract_line = (
-            '[CENTAUR_TASK_CONTRACT] '
-            '{"version":1,"unit":"set_exact","baseline":"lint-path-normalize","allowed_delta":[],"forbidden_delta":[],"precedence":["forbidden","allowed","wording"]}'
+    CONTRACT_LINE = (
+        '[CENTAUR_TASK_CONTRACT] '
+        '{"version":1,"unit":"set_exact","baseline":"lint-path-normalize","allowed_delta":[],"forbidden_delta":[],"precedence":["forbidden","allowed","wording"]}'
+    )
+    VALID_WORKER_END_STATE = {
+        "PATCH_APPLIED": 1,
+        "COMMIT_CREATED": 0,
+        "CARRYOVER_FILES": [],
+        "SEAL_MODE": "UNSEALED",
+        "RELEASE_DECISION": "READY",
+    }
+    VALID_SUPERVISOR_DISPATCH_GATE = {
+        "STATUS_CMD": "cd /repo && git status --short -- src/centaur/cli.py tests/test_cli.py",
+        "STATUS_RC": 0,
+        "STATUS_HAS_UNSEALED_DIRTY": 0,
+        "TARGET_DIFF_CMD": "cd /repo && git diff --name-only -- src/centaur/cli.py tests/test_cli.py",
+        "TARGET_DIFF_RC": 0,
+        "TARGET_DIFF_HAS_CHANGES": 0,
+        "TASK_KIND": "FEATURE",
+        "DISPATCH_DECISION": "ALLOW_FUNCTIONAL",
+    }
+
+    @classmethod
+    def _worker_end_state_line(cls, overrides: dict[str, object] | None = None) -> str:
+        payload = dict(cls.VALID_WORKER_END_STATE)
+        if overrides:
+            payload.update(overrides)
+        return "[CENTAUR_WORKER_END_STATE] " + json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+    @classmethod
+    def _supervisor_dispatch_gate_line(cls, overrides: dict[str, object] | None = None) -> str:
+        payload = dict(cls.VALID_SUPERVISOR_DISPATCH_GATE)
+        if overrides:
+            payload.update(overrides)
+        return "[CENTAUR_SUPERVISOR_DISPATCH_GATE] " + json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+    @classmethod
+    def _write_task_with_worker_end_state(cls, workspace: Path, line: str, gate_line: str | None = None) -> None:
+        resolved_gate_line = gate_line if gate_line is not None else cls._supervisor_dispatch_gate_line()
+        (workspace / "TASK.md").write_text(
+            (
+                "# 当前任务 (Task)\n\n"
+                "## 机审契约\n"
+                f"{cls.CONTRACT_LINE}\n\n"
+                f"{resolved_gate_line}\n\n"
+                "---\n"
+                "## Worker 反馈区\n"
+                "### Worker 执行报告 (2026-03-06 12:00 +0800)\n"
+                f"{line}\n"
+            ),
+            encoding="utf-8",
         )
+
+    def test_task_lint_normalizes_task_md_file_path_argument(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
             expected_task_path = (workspace / "TASK.md").resolve()
             (workspace / "TASK.md").write_text(
-                "# 当前任务 (Task)\n\n## 机审契约\n" + contract_line + "\n",
+                (
+                    "# 当前任务 (Task)\n\n## 机审契约\n"
+                    + self.CONTRACT_LINE
+                    + "\n"
+                    + self._supervisor_dispatch_gate_line()
+                    + "\n"
+                ),
                 encoding="utf-8",
             )
 
@@ -468,6 +547,154 @@ class TaskContractLintTests(unittest.TestCase):
 
             self.assertEqual(rc, 0)
             self.assertIn("结论: PASS", output)
+
+    def test_task_lint_requires_supervisor_dispatch_gate_when_contract_present(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "TASK.md").write_text(
+                (
+                    "# 当前任务 (Task)\n\n"
+                    "## 机审契约\n"
+                    f"{self.CONTRACT_LINE}\n"
+                ),
+                encoding="utf-8",
+            )
+
+            output_buffer = io.StringIO()
+            with redirect_stdout(output_buffer):
+                rc = cli.main(["task", "lint", str(workspace)])
+            output = output_buffer.getvalue()
+
+            self.assertEqual(rc, 1)
+            self.assertIn("BLOCKED_SPEC", output)
+            self.assertIn("缺少 `[CENTAUR_SUPERVISOR_DISPATCH_GATE]` 派单封板闸门证据", output)
+
+    def test_task_lint_requires_supervisor_dispatch_gate_command_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            gate_line = self._supervisor_dispatch_gate_line(
+                {
+                    "STATUS_CMD": "cd /repo && git status -- src/centaur/cli.py",
+                    "TARGET_DIFF_CMD": "cd /repo && git show --name-only",
+                }
+            )
+            self._write_task_with_worker_end_state(workspace, self._worker_end_state_line(), gate_line=gate_line)
+
+            output_buffer = io.StringIO()
+            with redirect_stdout(output_buffer):
+                rc = cli.main(["task", "lint", str(workspace)])
+            output = output_buffer.getvalue()
+
+            self.assertEqual(rc, 1)
+            self.assertIn("BLOCKED_SPEC", output)
+            self.assertIn("`STATUS_CMD` 必须包含 `git status --short` 证据", output)
+            self.assertIn("`TARGET_DIFF_CMD` 必须包含目标文件 `git diff` 证据", output)
+
+    def test_task_lint_blocks_function_task_when_unsealed_dirty_changes_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            gate_line = self._supervisor_dispatch_gate_line(
+                {
+                    "STATUS_HAS_UNSEALED_DIRTY": 1,
+                    "TASK_KIND": "FEATURE",
+                    "DISPATCH_DECISION": "ALLOW_FUNCTIONAL",
+                }
+            )
+            self._write_task_with_worker_end_state(workspace, self._worker_end_state_line(), gate_line=gate_line)
+
+            output_buffer = io.StringIO()
+            with redirect_stdout(output_buffer):
+                rc = cli.main(["task", "lint", str(workspace)])
+            output = output_buffer.getvalue()
+
+            self.assertEqual(rc, 1)
+            self.assertIn("BLOCKED_SPEC", output)
+            self.assertIn("检测到未封板业务脏改时，`DISPATCH_DECISION` 必须为 `SEAL_ONLY`", output)
+            self.assertIn("检测到未封板业务脏改时，功能任务必须阻断；仅允许 `TASK_KIND=SEAL_ONLY`", output)
+
+    def test_task_lint_allows_seal_only_task_when_unsealed_dirty_changes_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            gate_line = self._supervisor_dispatch_gate_line(
+                {
+                    "STATUS_HAS_UNSEALED_DIRTY": 1,
+                    "TASK_KIND": "SEAL_ONLY",
+                    "DISPATCH_DECISION": "SEAL_ONLY",
+                }
+            )
+            self._write_task_with_worker_end_state(workspace, self._worker_end_state_line(), gate_line=gate_line)
+
+            output_buffer = io.StringIO()
+            with redirect_stdout(output_buffer):
+                rc = cli.main(["task", "lint", str(workspace)])
+            output = output_buffer.getvalue()
+
+            self.assertEqual(rc, 0)
+            self.assertIn("结论: PASS", output)
+
+    def test_task_lint_passes_with_valid_worker_end_state_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            self._write_task_with_worker_end_state(workspace, self._worker_end_state_line())
+
+            output_buffer = io.StringIO()
+            with redirect_stdout(output_buffer):
+                rc = cli.main(["task", "lint", str(workspace)])
+            output = output_buffer.getvalue()
+
+            self.assertEqual(rc, 0)
+            self.assertIn("结论: PASS", output)
+
+    def test_task_lint_requires_worker_end_state_required_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            payload = dict(self.VALID_WORKER_END_STATE)
+            payload.pop("RELEASE_DECISION")
+            line = "[CENTAUR_WORKER_END_STATE] " + json.dumps(payload, ensure_ascii=False, sort_keys=True)
+            self._write_task_with_worker_end_state(workspace, line)
+
+            output_buffer = io.StringIO()
+            with redirect_stdout(output_buffer):
+                rc = cli.main(["task", "lint", str(workspace)])
+            output = output_buffer.getvalue()
+
+            self.assertEqual(rc, 1)
+            self.assertIn("BLOCKED_SPEC", output)
+            self.assertIn("结束态回填缺少 `RELEASE_DECISION`", output)
+
+    def test_task_lint_requires_commit_metadata_when_commit_created(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            line = self._worker_end_state_line({"COMMIT_CREATED": 1})
+            self._write_task_with_worker_end_state(workspace, line)
+
+            output_buffer = io.StringIO()
+            with redirect_stdout(output_buffer):
+                rc = cli.main(["task", "lint", str(workspace)])
+            output = output_buffer.getvalue()
+
+            self.assertEqual(rc, 1)
+            self.assertIn("BLOCKED_SPEC", output)
+            self.assertIn("`commit_sha` 必须是非空字符串", output)
+            self.assertIn("`commit_files` 必须是字符串数组", output)
+
+    def test_task_lint_requires_carryover_metadata_when_sealed_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            line = self._worker_end_state_line({"SEAL_MODE": "SEALED_BLOCKED"})
+            self._write_task_with_worker_end_state(workspace, line)
+
+            output_buffer = io.StringIO()
+            with redirect_stdout(output_buffer):
+                rc = cli.main(["task", "lint", str(workspace)])
+            output = output_buffer.getvalue()
+
+            self.assertEqual(rc, 1)
+            self.assertIn("BLOCKED_SPEC", output)
+            self.assertIn("`carryover_reason` 必须是非空字符串", output)
+            self.assertIn("`owner` 必须是非空字符串", output)
+            self.assertIn("`next_min_action` 必须是非空字符串", output)
+            self.assertIn("`SEAL_MODE=SEALED_BLOCKED` 时必须提供非空 `due_cycle`", output)
 
 
 if __name__ == "__main__":

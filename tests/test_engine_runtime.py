@@ -15,22 +15,27 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from centaur.engine import (  # noqa: E402
     CONTROL_DIR,
     CONTROL_TASKS_FILE,
+    DEFAULT_CODEX_EXEC_SANDBOX,
     DEFAULT_TASK_NAME,
     EVENTS_FILE,
     PROJECT_SCHEMA_VERSION,
+    RUNTIME_METRICS_FILE,
     RUNTIME_DIR,
     SCHEDULER_STATE_FILE,
     TASK_CONTRACT_MODE_ENFORCE,
     TASK_COMPLETION_EVIDENCE_PREFIX,
     append_event,
+    build_codex_exec_permission_args,
     ensure_runtime_layout,
     lint_task_contract,
     load_state,
     load_or_init_project_config,
     migrate_schema,
+    parse_runtime_policy,
     run_agent,
     run_workflow,
     save_project_config,
+    refresh_runtime_metrics,
     sync_task_bus_to_active,
     task_file_path,
     validate_task_name,
@@ -50,6 +55,56 @@ class EngineRuntimeTests(unittest.TestCase):
             self.assertIn("target_repo", config)
             self.assertIn("target_ref", config)
             self.assertIn("target_version", config)
+            self.assertIn("human_gate_policy", config)
+            self.assertIn("codex_exec_sandbox", config)
+            self.assertIn("codex_exec_dangerously_bypass", config)
+
+    def test_runtime_policy_parse_and_headless_permission_args(self) -> None:
+        cases = (
+            (
+                "explicit_sandbox",
+                {
+                    "human_gate_policy": "always",
+                    "codex_exec_sandbox": "read-only",
+                    "codex_exec_dangerously_bypass": False,
+                },
+                ["--sandbox", "read-only"],
+            ),
+            (
+                "default_workspace_write",
+                {
+                    "human_gate_policy": "risk",
+                    "codex_exec_sandbox": None,
+                    "codex_exec_dangerously_bypass": False,
+                },
+                ["--sandbox", DEFAULT_CODEX_EXEC_SANDBOX],
+            ),
+            (
+                "dangerously_bypass",
+                {
+                    "human_gate_policy": "off",
+                    "codex_exec_sandbox": None,
+                    "codex_exec_dangerously_bypass": True,
+                },
+                ["--dangerously-bypass-approvals-and-sandbox"],
+            ),
+        )
+
+        for case_name, payload, expected_args in cases:
+            with self.subTest(case=case_name):
+                policy = parse_runtime_policy(payload)
+                self.assertEqual(build_codex_exec_permission_args(policy), expected_args)
+
+    def test_runtime_policy_parse_rejects_bypass_and_sandbox_conflict(self) -> None:
+        with self.assertRaises(ValueError) as cm:
+            parse_runtime_policy(
+                {
+                    "human_gate_policy": "always",
+                    "codex_exec_sandbox": "workspace-write",
+                    "codex_exec_dangerously_bypass": True,
+                }
+            )
+        self.assertIn("禁止显式设置 `codex_exec_sandbox`", str(cm.exception))
 
     def test_active_task_file_sync(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -429,6 +484,208 @@ class EngineRuntimeTests(unittest.TestCase):
             self.assertIsNone(state["inflight_role"])
             self.assertIn("[BLOCKED_SPEC]", output)
             self.assertIn("centaur task lint", output)
+
+    def test_run_workflow_human_gate_policy_always_enters_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "PROPOSAL.md").write_text("proposal", encoding="utf-8")
+            (workspace / "TASK.md").write_text("# 当前任务 (Task)\n", encoding="utf-8")
+            config = load_or_init_project_config(workspace)
+            config["human_gate_policy"] = "always"
+            save_project_config(workspace, config)
+            ensure_runtime_layout(workspace)
+            (workspace / RUNTIME_DIR / "state.json").write_text(
+                json.dumps({"cycle": 2, "next_step": "human_gate"}),
+                encoding="utf-8",
+            )
+
+            def _fake_run_agent(role: str, *_args, **_kwargs) -> None:
+                if role == "Worker":
+                    append_event(workspace, cycle=2, event_type="role_end", role="worker", return_code=130)
+                raise SystemExit(1)
+
+            output_buffer = io.StringIO()
+            with patch("centaur.engine.run_agent", side_effect=_fake_run_agent), patch(
+                "centaur.engine.human_gate"
+            ) as mock_gate, redirect_stdout(output_buffer):
+                with self.assertRaises(SystemExit) as cm:
+                    run_workflow(workdir=workspace, headless=True)
+            output = output_buffer.getvalue()
+
+            self.assertEqual(cm.exception.code, 1)
+            self.assertEqual(mock_gate.call_count, 1)
+            self.assertIn("policy=always", output)
+            self.assertIn("decision=enter_gate", output)
+
+    def test_run_workflow_human_gate_policy_risk_supports_auto_pass_and_trigger(self) -> None:
+        scenarios = ("auto_pass", "trigger")
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario):
+                with tempfile.TemporaryDirectory() as tmp:
+                    workspace = Path(tmp)
+                    (workspace / "PROPOSAL.md").write_text("proposal", encoding="utf-8")
+                    if scenario == "trigger":
+                        (workspace / "TASK.md").write_text(
+                            (
+                                "# 当前任务 (Task)\n"
+                                "[CENTAUR_TASK_CONTRACT] "
+                                '{"version":1,"unit":"text_exact","allowed_delta":["tests/scripts/test_recovery_auto.sh"]}\n'
+                            ),
+                            encoding="utf-8",
+                        )
+                    else:
+                        (workspace / "TASK.md").write_text("# 当前任务 (Task)\n", encoding="utf-8")
+
+                    config = load_or_init_project_config(workspace)
+                    config["human_gate_policy"] = "risk"
+                    save_project_config(workspace, config)
+                    ensure_runtime_layout(workspace)
+                    (workspace / RUNTIME_DIR / "state.json").write_text(
+                        json.dumps({"cycle": 2, "next_step": "human_gate"}),
+                        encoding="utf-8",
+                    )
+
+                    def _fake_run_agent(role: str, *_args, **_kwargs) -> None:
+                        if role == "Worker":
+                            append_event(workspace, cycle=2, event_type="role_end", role="worker", return_code=130)
+                        raise SystemExit(1)
+
+                    output_buffer = io.StringIO()
+                    with patch("centaur.engine.human_gate") as mock_gate, patch(
+                        "centaur.engine.run_agent", side_effect=_fake_run_agent
+                    ) as mock_run_agent, redirect_stdout(output_buffer):
+                        with self.assertRaises(SystemExit) as cm:
+                            run_workflow(workdir=workspace, headless=True)
+                    output = output_buffer.getvalue()
+
+                    self.assertEqual(cm.exception.code, 1)
+                    self.assertIn("policy=risk", output)
+                    if scenario == "trigger":
+                        self.assertEqual(mock_gate.call_count, 1)
+                        mock_run_agent.assert_not_called()
+                        self.assertIn("decision=enter_gate", output)
+                    else:
+                        self.assertEqual(mock_gate.call_count, 0)
+                        self.assertIn("decision=auto_pass", output)
+
+    def test_run_workflow_human_gate_policy_off_fail_closed_and_skip(self) -> None:
+        scenarios = (
+            ("skip_gate", True, 0, "decision=skip_gate"),
+            ("fail_closed", False, 1, "decision=enter_gate_fail_closed"),
+        )
+        for scenario_name, codex_is_available, expected_gate_calls, expected_decision in scenarios:
+            with self.subTest(scenario=scenario_name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    workspace = Path(tmp)
+                    (workspace / "PROPOSAL.md").write_text("proposal", encoding="utf-8")
+                    (workspace / "TASK.md").write_text("# 当前任务 (Task)\n", encoding="utf-8")
+                    config = load_or_init_project_config(workspace)
+                    config["human_gate_policy"] = "off"
+                    save_project_config(workspace, config)
+                    ensure_runtime_layout(workspace)
+                    (workspace / RUNTIME_DIR / "state.json").write_text(
+                        json.dumps({"cycle": 2, "next_step": "human_gate"}),
+                        encoding="utf-8",
+                    )
+
+                    def _fake_run_agent(role: str, *_args, **_kwargs) -> None:
+                        if role == "Worker":
+                            append_event(workspace, cycle=2, event_type="role_end", role="worker", return_code=130)
+                        raise SystemExit(1)
+
+                    output_buffer = io.StringIO()
+                    with patch("centaur.engine.codex_available", return_value=codex_is_available), patch(
+                        "centaur.engine.human_gate"
+                    ) as mock_gate, patch("centaur.engine.run_agent", side_effect=_fake_run_agent), redirect_stdout(
+                        output_buffer
+                    ):
+                        with self.assertRaises(SystemExit) as cm:
+                            run_workflow(workdir=workspace, headless=True)
+                    output = output_buffer.getvalue()
+
+                    self.assertEqual(cm.exception.code, 1)
+                    self.assertEqual(mock_gate.call_count, expected_gate_calls)
+                    self.assertIn("policy=off", output)
+                    self.assertIn(expected_decision, output)
+
+    def test_run_workflow_headless_permission_args_follow_runtime_policy(self) -> None:
+        cases = (
+            (
+                "explicit_sandbox",
+                {"codex_exec_sandbox": "read-only", "codex_exec_dangerously_bypass": False},
+                ["--sandbox", "read-only"],
+            ),
+            (
+                "default_sandbox",
+                {"codex_exec_sandbox": None, "codex_exec_dangerously_bypass": False},
+                ["--sandbox", DEFAULT_CODEX_EXEC_SANDBOX],
+            ),
+            (
+                "dangerously_bypass",
+                {"codex_exec_sandbox": None, "codex_exec_dangerously_bypass": True},
+                ["--dangerously-bypass-approvals-and-sandbox"],
+            ),
+        )
+        for case_name, policy_updates, expected_exec_args in cases:
+            with self.subTest(case=case_name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    workspace = Path(tmp)
+                    (workspace / "PROPOSAL.md").write_text("proposal", encoding="utf-8")
+                    (workspace / "TASK.md").write_text("# 当前任务 (Task)\n", encoding="utf-8")
+                    config = load_or_init_project_config(workspace)
+                    config.update(policy_updates)
+                    save_project_config(workspace, config)
+                    ensure_runtime_layout(workspace)
+                    (workspace / RUNTIME_DIR / "state.json").write_text(
+                        json.dumps({"cycle": 2, "next_step": "worker"}),
+                        encoding="utf-8",
+                    )
+
+                    observed: dict[str, object] = {}
+
+                    def _fake_run_agent(role: str, *_args, **kwargs) -> None:
+                        observed["role"] = role
+                        observed["headless_exec_args"] = kwargs.get("headless_exec_args")
+                        raise SystemExit(77)
+
+                    with patch("centaur.engine.run_agent", side_effect=_fake_run_agent):
+                        with self.assertRaises(SystemExit) as cm:
+                            run_workflow(workdir=workspace, start_step="worker", headless=True)
+
+                    self.assertEqual(cm.exception.code, 77)
+                    self.assertEqual(observed["role"], "Worker")
+                    self.assertEqual(observed["headless_exec_args"], expected_exec_args)
+
+    def test_run_workflow_fails_fast_on_invalid_runtime_policy(self) -> None:
+        invalid_cases = (
+            ("invalid_human_gate_policy", {"human_gate_policy": "invalid-token"}, "`human_gate_policy` 非法"),
+            (
+                "bypass_conflicts_with_sandbox",
+                {"codex_exec_dangerously_bypass": True, "codex_exec_sandbox": "read-only"},
+                "禁止显式设置 `codex_exec_sandbox`",
+            ),
+        )
+        for case_name, updates, marker in invalid_cases:
+            with self.subTest(case=case_name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    workspace = Path(tmp)
+                    (workspace / "PROPOSAL.md").write_text("proposal", encoding="utf-8")
+                    (workspace / "TASK.md").write_text("# 当前任务 (Task)\n", encoding="utf-8")
+                    config = load_or_init_project_config(workspace)
+                    config.update(updates)
+                    save_project_config(workspace, config)
+
+                    output_buffer = io.StringIO()
+                    with patch("centaur.engine.run_agent") as mock_run_agent, redirect_stdout(output_buffer):
+                        with self.assertRaises(SystemExit) as cm:
+                            run_workflow(workdir=workspace, start_step="worker", headless=True)
+                    output = output_buffer.getvalue()
+
+                    self.assertEqual(cm.exception.code, 1)
+                    mock_run_agent.assert_not_called()
+                    self.assertIn("[RUNTIME_CONFIG_ERROR]", output)
+                    self.assertIn("[NEXT_STEP]", output)
+                    self.assertIn(marker, output)
 
     def test_sh_2_13_load_state_fail_fast_on_invalid_control_schema(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1257,6 +1514,149 @@ class EngineRuntimeTests(unittest.TestCase):
                     self.assertEqual(payload["role"], "worker")
                     self.assertEqual(payload["status"], "completed")
                     self.assertTrue(payload["run_id"])
+
+    def test_append_event_refreshes_runtime_metrics_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            ensure_runtime_layout(workspace)
+            append_event(workspace, cycle=1, event_type="cycle_start")
+
+            metrics_path = workspace / RUNTIME_DIR / RUNTIME_METRICS_FILE
+            self.assertTrue(metrics_path.exists())
+            metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+            self.assertEqual(metrics["source"], f"{RUNTIME_DIR}/{EVENTS_FILE}")
+            self.assertEqual(metrics["summary"]["total_cycles"], 1)
+
+    def test_runtime_metrics_cover_cycle_duration_role_duration_and_pass_rate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            ensure_runtime_layout(workspace)
+            events_path = workspace / RUNTIME_DIR / EVENTS_FILE
+            event_lines = [
+                {"timestamp": "2026-03-05T00:00:00+00:00", "cycle": 1, "event_type": "cycle_start"},
+                {"timestamp": "2026-03-05T00:00:01+00:00", "cycle": 1, "event_type": "role_start", "role": "supervisor"},
+                {
+                    "timestamp": "2026-03-05T00:00:03+00:00",
+                    "cycle": 1,
+                    "event_type": "role_end",
+                    "role": "supervisor",
+                    "return_code": 0,
+                },
+                {"timestamp": "2026-03-05T00:00:05+00:00", "cycle": 1, "event_type": "role_start", "role": "worker"},
+                {"timestamp": "2026-03-05T00:00:09+00:00", "cycle": 1, "event_type": "role_end", "role": "worker", "return_code": 0},
+                {"timestamp": "2026-03-05T00:00:10+00:00", "cycle": 1, "event_type": "role_start", "role": "validator"},
+                {
+                    "timestamp": "2026-03-05T00:00:13+00:00",
+                    "cycle": 1,
+                    "event_type": "role_end",
+                    "role": "validator",
+                    "return_code": 0,
+                },
+                {"timestamp": "2026-03-05T00:00:15+00:00", "cycle": 1, "event_type": "cycle_end"},
+                {"timestamp": "2026-03-05T00:01:00+00:00", "cycle": 2, "event_type": "cycle_start"},
+                {"timestamp": "2026-03-05T00:01:02+00:00", "cycle": 2, "event_type": "role_start", "role": "worker"},
+                {"timestamp": "2026-03-05T00:01:05+00:00", "cycle": 2, "event_type": "role_end", "role": "worker", "return_code": 0},
+            ]
+            events_path.write_text(
+                "\n".join(json.dumps(item, ensure_ascii=False) for item in event_lines) + "\n",
+                encoding="utf-8",
+            )
+
+            refresh_runtime_metrics(workspace)
+
+            metrics_path = workspace / RUNTIME_DIR / RUNTIME_METRICS_FILE
+            self.assertTrue(metrics_path.exists())
+            metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+            summary = metrics["summary"]
+            self.assertEqual(summary["total_cycles"], 2)
+            self.assertEqual(summary["successful_cycles"], 1)
+            self.assertEqual(summary["pass_rate"], 0.5)
+
+            cycles = metrics["cycles"]
+            self.assertEqual([item["cycle"] for item in cycles], [1, 2])
+            self.assertEqual(cycles[0]["status"], "passed")
+            self.assertEqual(cycles[0]["duration_seconds"], 15.0)
+            self.assertEqual(cycles[0]["role_durations"]["supervisor"]["total_seconds"], 2.0)
+            self.assertEqual(cycles[0]["role_durations"]["worker"]["total_seconds"], 4.0)
+            self.assertEqual(cycles[0]["role_durations"]["validator"]["total_seconds"], 3.0)
+            self.assertEqual(cycles[1]["status"], "incomplete")
+            self.assertIsNone(cycles[1]["duration_seconds"])
+            self.assertEqual(cycles[1]["role_durations"]["worker"]["total_seconds"], 3.0)
+
+            role_durations = metrics["role_durations"]
+            self.assertEqual(role_durations["worker"]["total_seconds"], 7.0)
+            self.assertEqual(role_durations["worker"]["runs"], 2)
+            self.assertEqual(role_durations["worker"]["avg_seconds"], 3.5)
+
+    def test_runtime_metrics_handle_incomplete_or_invalid_samples_deterministically(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            ensure_runtime_layout(workspace)
+            events_path = workspace / RUNTIME_DIR / EVENTS_FILE
+            raw_lines = [
+                json.dumps({"timestamp": "2026-03-05T00:00:00+00:00", "cycle": 1, "event_type": "cycle_start"}, ensure_ascii=False),
+                json.dumps(
+                    {"timestamp": "2026-03-05T00:00:02+00:00", "cycle": 1, "event_type": "role_start", "role": "worker"},
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "timestamp": "2026-03-05T00:00:06+00:00",
+                        "cycle": 1,
+                        "event_type": "role_end",
+                        "role": "worker",
+                        "return_code": 0,
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps({"timestamp": "bad-ts", "cycle": 1, "event_type": "cycle_end"}, ensure_ascii=False),
+                json.dumps({"timestamp": "2026-03-05T00:01:00+00:00", "cycle": 2, "event_type": "cycle_start"}, ensure_ascii=False),
+                json.dumps(
+                    {
+                        "timestamp": "2026-03-05T00:01:02+00:00",
+                        "cycle": 2,
+                        "event_type": "role_end",
+                        "role": "worker",
+                        "return_code": 0,
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {"timestamp": "2026-03-05T00:01:03+00:00", "cycle": 2, "event_type": "role_start", "role": "worker"},
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "timestamp": "2026-03-05T00:01:07+00:00",
+                        "cycle": 2,
+                        "event_type": "role_end",
+                        "role": "worker",
+                        "return_code": 0,
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps({"timestamp": "2026-03-05T00:01:08+00:00", "event_type": "role_start", "role": "worker"}, ensure_ascii=False),
+                "{bad-json",
+            ]
+            events_path.write_text("\n".join(raw_lines) + "\n", encoding="utf-8")
+
+            refresh_runtime_metrics(workspace)
+
+            metrics = json.loads((workspace / RUNTIME_DIR / RUNTIME_METRICS_FILE).read_text(encoding="utf-8"))
+            summary = metrics["summary"]
+            self.assertEqual(summary["total_cycles"], 2)
+            self.assertEqual(summary["successful_cycles"], 1)
+            self.assertEqual(summary["pass_rate"], 0.5)
+            self.assertEqual(summary["incomplete_cycle_duration_count"], 2)
+            self.assertEqual(summary["incomplete_role_duration_count"], 1)
+            self.assertEqual(summary["invalid_event_count"], 2)
+
+            cycles = metrics["cycles"]
+            self.assertEqual(cycles[0]["cycle"], 1)
+            self.assertIsNone(cycles[0]["duration_seconds"])
+            self.assertEqual(cycles[1]["cycle"], 2)
+            self.assertIsNone(cycles[1]["duration_seconds"])
+            self.assertEqual(cycles[1]["role_durations"]["worker"]["total_seconds"], 4.0)
 
     @patch("centaur.engine.resolve_prompt_content", return_value=("worker prompt", "测试模板"))
     @patch("centaur.engine.subprocess.run")

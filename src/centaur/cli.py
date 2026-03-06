@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from importlib.resources import files
 from pathlib import Path
 import time
@@ -26,9 +27,11 @@ from centaur.engine import (
     STATE_FILE,
     codex_available,
     collect_prompt_mode_issues,
+    build_codex_exec_permission_args,
     default_project_config,
     ensure_active_task_file,
     ensure_runtime_layout,
+    format_runtime_policy_audit,
     infer_prompt_mode_from_workspace,
     init_state_file,
     is_framework_repo_root,
@@ -36,6 +39,7 @@ from centaur.engine import (
     load_project_config,
     load_or_init_project_config,
     migrate_schema,
+    parse_runtime_policy,
     run_workflow,
     save_project_config,
     sync_task_bus_to_active,
@@ -48,11 +52,234 @@ from centaur.engine import (
 RUNTIME_STATE_PATH = f"{RUNTIME_DIR}/{STATE_FILE}"
 RUNTIME_PROJECT_PATH = f"{RUNTIME_DIR}/{PROJECT_FILE}"
 DOCTOR_LOG_WRITE_PROBE = ".doctor_write_probe"
+WORKER_REPORT_HEADER = "### Worker 执行报告"
+WORKER_END_STATE_PREFIX = "[CENTAUR_WORKER_END_STATE] "
+WORKER_END_STATE_REQUIRED_FIELDS = (
+    "PATCH_APPLIED",
+    "COMMIT_CREATED",
+    "CARRYOVER_FILES",
+    "SEAL_MODE",
+    "RELEASE_DECISION",
+)
+SUPERVISOR_DISPATCH_GATE_PREFIX = "[CENTAUR_SUPERVISOR_DISPATCH_GATE] "
+SUPERVISOR_DISPATCH_GATE_REQUIRED_FIELDS = (
+    "STATUS_CMD",
+    "STATUS_RC",
+    "STATUS_HAS_UNSEALED_DIRTY",
+    "TARGET_DIFF_CMD",
+    "TARGET_DIFF_RC",
+    "TARGET_DIFF_HAS_CHANGES",
+    "TASK_KIND",
+    "DISPATCH_DECISION",
+)
+SUPERVISOR_DISPATCH_GATE_TASK_KINDS = ("FEATURE", "SEAL_ONLY")
+SUPERVISOR_DISPATCH_GATE_DECISIONS = ("ALLOW_FUNCTIONAL", "SEAL_ONLY")
 
 
 def _resolve_workspace(path_arg: str, workspace_arg: str | None) -> Path:
     target = workspace_arg if workspace_arg else path_arg
     return Path(target).resolve()
+
+
+def _resolve_task_lint_workspace(path_arg: str, workspace_arg: str | None) -> Path:
+    target = _resolve_workspace(path_arg, workspace_arg)
+    if target.is_dir():
+        return target
+    if target.name == "TASK.md":
+        return target.parent
+    return target
+
+
+def _read_task_lines(task_path: Path) -> tuple[list[str], list[str]]:
+    try:
+        return task_path.read_text(encoding="utf-8").splitlines(), []
+    except OSError as exc:
+        return [], [f"读取 TASK.md 失败: {exc}"]
+
+
+def _normalize_required_string_list(value: object, field_name: str, errors: list[str], *, allow_empty: bool) -> list[str]:
+    if not isinstance(value, list):
+        errors.append(f"`{field_name}` 必须是字符串数组")
+        return []
+
+    normalized: list[str] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, str) or not item.strip():
+            errors.append(f"`{field_name}[{index}]` 必须是非空字符串")
+            continue
+        normalized.append(item.strip())
+
+    if not allow_empty and not normalized:
+        errors.append(f"`{field_name}` 不能为空")
+    return normalized
+
+
+def _normalize_required_binary(value: object, field_name: str, errors: list[str]) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value not in (0, 1):
+        errors.append(f"`{field_name}` 必须是 0 或 1")
+        return None
+    return value
+
+
+def _normalize_required_nonempty_string(value: object, field_name: str, errors: list[str]) -> str:
+    if not isinstance(value, str) or not value.strip():
+        errors.append(f"`{field_name}` 必须是非空字符串")
+        return ""
+    return value.strip()
+
+
+def _normalize_required_nonnegative_int(value: object, field_name: str, errors: list[str]) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        errors.append(f"`{field_name}` 必须是非负整数")
+        return None
+    return value
+
+
+def _find_latest_supervisor_dispatch_gate_payload(task_path: Path) -> tuple[dict[str, object] | None, list[str]]:
+    lines, read_errors = _read_task_lines(task_path)
+    if read_errors:
+        return None, read_errors
+
+    for raw_line in reversed(lines):
+        line = raw_line.strip()
+        if not line.startswith(SUPERVISOR_DISPATCH_GATE_PREFIX):
+            continue
+        payload_text = line[len(SUPERVISOR_DISPATCH_GATE_PREFIX) :].strip()
+        try:
+            payload = json.loads(payload_text)
+        except json.JSONDecodeError as exc:
+            return None, [f"`{SUPERVISOR_DISPATCH_GATE_PREFIX.strip()}` JSON 非法: {exc}"]
+        if not isinstance(payload, dict):
+            return None, [f"`{SUPERVISOR_DISPATCH_GATE_PREFIX.strip()}` 载荷必须是 JSON 对象"]
+        return payload, []
+    return None, [f"缺少 `{SUPERVISOR_DISPATCH_GATE_PREFIX.strip()}` 派单封板闸门证据"]
+
+
+def _lint_supervisor_dispatch_gate(task_path: Path) -> tuple[list[str], list[str]]:
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    payload, parse_errors = _find_latest_supervisor_dispatch_gate_payload(task_path)
+    if parse_errors:
+        return parse_errors, warnings
+    if payload is None:
+        return errors, warnings
+
+    for field_name in SUPERVISOR_DISPATCH_GATE_REQUIRED_FIELDS:
+        if field_name not in payload:
+            errors.append(f"派单封板闸门缺少 `{field_name}`")
+
+    status_cmd = _normalize_required_nonempty_string(payload.get("STATUS_CMD"), "STATUS_CMD", errors)
+    status_rc = _normalize_required_nonnegative_int(payload.get("STATUS_RC"), "STATUS_RC", errors)
+    status_has_unsealed_dirty = _normalize_required_binary(
+        payload.get("STATUS_HAS_UNSEALED_DIRTY"), "STATUS_HAS_UNSEALED_DIRTY", errors
+    )
+    target_diff_cmd = _normalize_required_nonempty_string(payload.get("TARGET_DIFF_CMD"), "TARGET_DIFF_CMD", errors)
+    target_diff_rc = _normalize_required_nonnegative_int(payload.get("TARGET_DIFF_RC"), "TARGET_DIFF_RC", errors)
+    _normalize_required_binary(payload.get("TARGET_DIFF_HAS_CHANGES"), "TARGET_DIFF_HAS_CHANGES", errors)
+
+    task_kind_raw = _normalize_required_nonempty_string(payload.get("TASK_KIND"), "TASK_KIND", errors)
+    dispatch_decision_raw = _normalize_required_nonempty_string(payload.get("DISPATCH_DECISION"), "DISPATCH_DECISION", errors)
+
+    if status_cmd and "git status --short" not in status_cmd:
+        errors.append("`STATUS_CMD` 必须包含 `git status --short` 证据")
+    if status_rc is not None and status_rc != 0:
+        errors.append("`STATUS_RC` 必须为 0，否则无法确认派单前封板闸门已执行")
+
+    if target_diff_cmd and "git diff" not in target_diff_cmd:
+        errors.append("`TARGET_DIFF_CMD` 必须包含目标文件 `git diff` 证据")
+    if target_diff_rc is not None and target_diff_rc != 0:
+        errors.append("`TARGET_DIFF_RC` 必须为 0，否则无法确认目标文件 diff 检查已执行")
+
+    task_kind = task_kind_raw.upper()
+    dispatch_decision = dispatch_decision_raw.upper()
+    if task_kind and task_kind not in SUPERVISOR_DISPATCH_GATE_TASK_KINDS:
+        errors.append(f"`TASK_KIND` 非法，必须是 {SUPERVISOR_DISPATCH_GATE_TASK_KINDS}")
+    if dispatch_decision and dispatch_decision not in SUPERVISOR_DISPATCH_GATE_DECISIONS:
+        errors.append(f"`DISPATCH_DECISION` 非法，必须是 {SUPERVISOR_DISPATCH_GATE_DECISIONS}")
+
+    if status_has_unsealed_dirty == 1:
+        if dispatch_decision != "SEAL_ONLY":
+            errors.append("检测到未封板业务脏改时，`DISPATCH_DECISION` 必须为 `SEAL_ONLY`")
+        if task_kind != "SEAL_ONLY":
+            errors.append("检测到未封板业务脏改时，功能任务必须阻断；仅允许 `TASK_KIND=SEAL_ONLY`")
+
+    return errors, warnings
+
+
+def _find_latest_worker_end_state_payload(task_path: Path) -> tuple[dict[str, object] | None, list[str], bool]:
+    lines, read_errors = _read_task_lines(task_path)
+    if read_errors:
+        return None, read_errors, False
+
+    latest_worker_index = -1
+    for index, raw_line in enumerate(lines):
+        if raw_line.strip().startswith(WORKER_REPORT_HEADER):
+            latest_worker_index = index
+
+    if latest_worker_index < 0:
+        return None, [], False
+
+    for raw_line in reversed(lines[latest_worker_index + 1 :]):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if not line.startswith(WORKER_END_STATE_PREFIX):
+            continue
+
+        payload_text = line[len(WORKER_END_STATE_PREFIX) :].strip()
+        try:
+            payload = json.loads(payload_text)
+        except json.JSONDecodeError as exc:
+            return None, [f"`{WORKER_END_STATE_PREFIX.strip()}` JSON 非法: {exc}"], True
+
+        if not isinstance(payload, dict):
+            return None, [f"`{WORKER_END_STATE_PREFIX.strip()}` 载荷必须是 JSON 对象"], True
+        return payload, [], True
+
+    return None, [f"最新 Worker 执行报告缺少 `{WORKER_END_STATE_PREFIX.strip()}` 回填字段"], True
+
+
+def _lint_worker_end_state(task_path: Path) -> tuple[list[str], list[str]]:
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    payload, parse_errors, worker_report_found = _find_latest_worker_end_state_payload(task_path)
+    if parse_errors:
+        return parse_errors, warnings
+    if not worker_report_found:
+        return errors, warnings
+    if payload is None:
+        return errors, warnings
+
+    for field_name in WORKER_END_STATE_REQUIRED_FIELDS:
+        if field_name not in payload:
+            errors.append(f"结束态回填缺少 `{field_name}`")
+
+    _normalize_required_binary(payload.get("PATCH_APPLIED"), "PATCH_APPLIED", errors)
+    commit_created = _normalize_required_binary(payload.get("COMMIT_CREATED"), "COMMIT_CREATED", errors)
+    _normalize_required_string_list(payload.get("CARRYOVER_FILES"), "CARRYOVER_FILES", errors, allow_empty=True)
+    seal_mode = _normalize_required_nonempty_string(payload.get("SEAL_MODE"), "SEAL_MODE", errors)
+    _normalize_required_nonempty_string(payload.get("RELEASE_DECISION"), "RELEASE_DECISION", errors)
+
+    if commit_created == 1:
+        _normalize_required_nonempty_string(payload.get("commit_sha"), "commit_sha", errors)
+        _normalize_required_string_list(payload.get("commit_files"), "commit_files", errors, allow_empty=False)
+
+    if seal_mode.upper() == "SEALED_BLOCKED":
+        _normalize_required_nonempty_string(payload.get("carryover_reason"), "carryover_reason", errors)
+        _normalize_required_nonempty_string(payload.get("owner"), "owner", errors)
+        _normalize_required_nonempty_string(payload.get("next_min_action"), "next_min_action", errors)
+        due_cycle = payload.get("due_cycle")
+        if (
+            isinstance(due_cycle, bool)
+            or due_cycle is None
+            or (isinstance(due_cycle, str) and not due_cycle.strip())
+            or (not isinstance(due_cycle, (int, str)))
+        ):
+            errors.append("`SEAL_MODE=SEALED_BLOCKED` 时必须提供非空 `due_cycle`")
+
+    return errors, warnings
 
 
 def _init_workspace(target_dir: Path, freeze_prompts: bool, force: bool) -> int:
@@ -319,7 +546,7 @@ def cmd_task_switch(args: argparse.Namespace) -> int:
 
 
 def cmd_task_lint(args: argparse.Namespace) -> int:
-    target_dir = _resolve_workspace(args.path, args.workspace)
+    target_dir = _resolve_task_lint_workspace(args.path, args.workspace)
     if not target_dir.exists():
         _emit_cli_error(
             f"工作区不存在: {target_dir}",
@@ -328,6 +555,15 @@ def cmd_task_lint(args: argparse.Namespace) -> int:
         return 1
 
     errors, warnings, contract = lint_task_contract(target_dir)
+    if contract is not None:
+        dispatch_gate_errors, dispatch_gate_warnings = _lint_supervisor_dispatch_gate(target_dir / "TASK.md")
+        errors.extend(dispatch_gate_errors)
+        warnings.extend(dispatch_gate_warnings)
+
+        end_state_errors, end_state_warnings = _lint_worker_end_state(target_dir / "TASK.md")
+        errors.extend(end_state_errors)
+        warnings.extend(end_state_warnings)
+
     print(f"🧪 TASK 契约检查: {target_dir / 'TASK.md'}")
     if contract is not None:
         print(f"- INFO: unit={contract.get('unit')} | baseline={contract.get('baseline', '')}")
@@ -396,12 +632,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         prompt_mode = inferred_mode
         active_task = DEFAULT_TASK_NAME
         task_contract_mode = TASK_CONTRACT_MODE_ENFORCE
+        runtime_config = default_project_config(prompt_mode=inferred_mode)
     else:
         prompt_mode = str(config.get("prompt_mode", PROMPT_MODE_GLOBAL))
         active_task = str(config.get("active_task", DEFAULT_TASK_NAME))
         task_contract_mode = str(config.get("task_contract_mode", TASK_CONTRACT_MODE_ENFORCE))
         if task_contract_mode not in (TASK_CONTRACT_MODE_OFF, TASK_CONTRACT_MODE_WARN, TASK_CONTRACT_MODE_ENFORCE):
             task_contract_mode = TASK_CONTRACT_MODE_ENFORCE
+        runtime_config = config
         infos.append(f"prompt_mode={prompt_mode}")
         infos.append(f"project_config={target_dir / RUNTIME_PROJECT_PATH}")
         infos.append(f"active_task={active_task}")
@@ -410,6 +648,17 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         infos.append(f"target_repo={config.get('target_repo', '')}")
         infos.append(f"target_ref={config.get('target_ref', '')}")
         infos.append(f"target_version={config.get('target_version', '')}")
+
+    infos.append(f"human_gate_policy={runtime_config.get('human_gate_policy', 'always')!r}")
+    infos.append(f"codex_exec_sandbox={runtime_config.get('codex_exec_sandbox')!r}")
+    infos.append(f"codex_exec_dangerously_bypass={runtime_config.get('codex_exec_dangerously_bypass', False)!r}")
+    try:
+        runtime_policy = parse_runtime_policy(runtime_config)
+    except ValueError as exc:
+        errors.append(f"运行策略配置非法: {exc}")
+    else:
+        infos.append(f"runtime_policy={format_runtime_policy_audit(runtime_policy)}")
+        infos.append("codex_exec_permission_args=" + " ".join(build_codex_exec_permission_args(runtime_policy)))
 
     pm_errors, pm_warnings = collect_prompt_mode_issues(target_dir, prompt_mode)
     errors.extend(pm_errors)

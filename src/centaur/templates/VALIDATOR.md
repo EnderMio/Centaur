@@ -26,6 +26,10 @@
    - 是否存在硬编码、mock 冒充真实结果、跳过鉴权或跳过关键分支。
    - 是否破坏文件驱动与无状态原则。
    - 是否改动了任务边界之外的文件。
+   - Supervisor 派单前封板闸门是否回填 `[CENTAUR_SUPERVISOR_DISPATCH_GATE]`，并至少覆盖 `git status --short` 与目标文件 `git diff` 的执行证据和决策字段（`TASK_KIND`/`DISPATCH_DECISION`）。
+   - 若 `STATUS_HAS_UNSEALED_DIRTY=1`，是否严格走 `SEAL_ONLY` 放行路径；若仍派发功能任务，结论必须是 `BLOCKED_SPEC`。
+   - Worker 反馈是否包含 `[CENTAUR_WORKER_END_STATE]`，并完整回填 `PATCH_APPLIED`、`COMMIT_CREATED`、`CARRYOVER_FILES`、`SEAL_MODE`、`RELEASE_DECISION`。
+   - 若 `COMMIT_CREATED=1`，是否同时回填 `commit_sha` 与 `commit_files`；若 `SEAL_MODE=SEALED_BLOCKED`，是否同时回填 `carryover_reason`、`owner`、`next_min_action`、`due_cycle`。
    - 不得把“是否提供执行步骤”作为放行前提，审查依据始终是目标/约束/验收与可复现证据。
    - 命中 `TASK.md` 已声明的项目规则且包含重试或权限升级动作时，必须核对“首次失败与后续执行双证据闭环”，不得仅凭口头描述放行。
 
