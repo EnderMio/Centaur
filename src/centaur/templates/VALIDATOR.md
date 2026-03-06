@@ -34,6 +34,10 @@
    - Worker 反馈是否包含 `[CENTAUR_WORKER_END_STATE]`，并完整回填 `PATCH_APPLIED`、`COMMIT_CREATED`、`CARRYOVER_FILES`、`SEAL_MODE`、`RELEASE_DECISION`。
    - 若 `COMMIT_CREATED=1`，是否同时回填 `commit_sha` 与 `commit_files`，且 `commit_files` 与 `git show --name-only --pretty=format: <commit_sha>` 一致；若 `SEAL_MODE=SEALED_BLOCKED`，是否同时回填 `carryover_reason`、`owner`、`next_min_action`、`due_cycle`。
    - 结构化机审行是否被反引号包裹或含 `$()` 命令替换污染；命中即 `BLOCKED_SPEC`。
+   - Worker 是否回填 `[CENTAUR_COMPLEXITY_IMPACT]`，字段至少含 `change_scope`、`complexity_delta`、`runtime_impact`、`maintainability_impact`、`risk_level`、`evidence_refs`。
+   - Validator 是否回填 `[CENTAUR_COMPLEXITY_REVIEW]`，字段至少含 `decision`、`risk_level`、`reason`、`required_action`。
+   - 复杂度最小证据标准是否齐全：影响域、复杂度变化依据、测试/基准证据、回滚/缓解动作。
+   - 当 `risk_level` 为高风险且证据不足时，是否执行 `decision=veto`（Fail-Closed）。
    - 对 end-state 解析缺失/JSON 非法/字段非法执行 Fail-Closed，不得静默放行到下一阶段。
    - 命中 `PATCH_APPLIED=1` 且 `COMMIT_CREATED=0` 时，若未满足 `SEAL_MODE=SEALED_BLOCKED` 最小映射字段，必须直接判定驳回并阻断推进（不得进入下一阶段）。
    - 不得把“是否提供执行步骤”作为放行前提，审查依据始终是目标/约束/验收与可复现证据。
@@ -58,6 +62,10 @@
   - `命令B` -> RC=1, 关键报错: ...
 - 风险与证据:
   - ...
+- 复杂度复核结论 (机审必填，单行 JSON):
+  [CENTAUR_COMPLEXITY_REVIEW] {"decision":"pass","risk_level":"","reason":"","required_action":""}
+  - `decision` 仅允许 `pass|veto`
+  - 若命中高风险且证据不足，必须 `decision=veto`
 - 给 Supervisor 的建议:
   - 若 `PASS`：建议进入下一任务。
   - 若 `FAIL_IMPL`：给出最小修复方向（不直接改代码）。

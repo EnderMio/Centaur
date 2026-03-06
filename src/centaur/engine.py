@@ -54,9 +54,12 @@ ROLE_LABELS = {
 TRANSACTION_STATE_FIELDS = ("inflight_role", "run_id", "started_at", "attempt")
 TASK_COMPLETION_EVIDENCE_PREFIX = "[CENTAUR_ROLE_COMPLETION] "
 TASK_CONTRACT_PREFIX = "[CENTAUR_TASK_CONTRACT] "
+COMPLEXITY_IMPACT_PREFIX = "[CENTAUR_COMPLEXITY_IMPACT] "
+COMPLEXITY_REVIEW_PREFIX = "[CENTAUR_COMPLEXITY_REVIEW] "
 TASK_FEEDBACK_SECTION_SEPARATOR = "---"
 TASK_FEEDBACK_SECTION_HEADER = "## Worker 反馈区"
 WORKER_REPORT_HEADER = "### Worker 执行报告"
+VALIDATOR_REPORT_HEADER = "### Validator 审查报告"
 WORKER_END_STATE_PREFIX = "[CENTAUR_WORKER_END_STATE] "
 WORKER_END_STATE_REQUIRED_FIELDS = (
     "PATCH_APPLIED",
@@ -65,6 +68,18 @@ WORKER_END_STATE_REQUIRED_FIELDS = (
     "SEAL_MODE",
     "RELEASE_DECISION",
 )
+COMPLEXITY_IMPACT_REQUIRED_FIELDS = (
+    "change_scope",
+    "complexity_delta",
+    "runtime_impact",
+    "maintainability_impact",
+    "risk_level",
+    "evidence_refs",
+)
+COMPLEXITY_REVIEW_REQUIRED_FIELDS = ("decision", "risk_level", "reason", "required_action")
+COMPLEXITY_REVIEW_DECISIONS = ("pass", "veto")
+COMPLEXITY_HIGH_RISK_LEVELS = ("high", "critical", "高")
+COMPLEXITY_HIGH_RISK_MIN_EVIDENCE_REFS = 2
 SUPERVISOR_DISPATCH_GATE_PREFIX = "[CENTAUR_SUPERVISOR_DISPATCH_GATE] "
 SUPERVISOR_DISPATCH_GATE_REQUIRED_FIELDS = (
     "STATUS_CMD",
@@ -87,6 +102,8 @@ STRUCTURED_EVIDENCE_PREFIXES = (
     TASK_CONTRACT_PREFIX,
     SUPERVISOR_DISPATCH_GATE_PREFIX,
     WORKER_END_STATE_PREFIX,
+    COMPLEXITY_IMPACT_PREFIX,
+    COMPLEXITY_REVIEW_PREFIX,
     TASK_COMPLETION_EVIDENCE_PREFIX,
 )
 GIT_WORKTREE_PROBE_CMD = "git rev-parse --is-inside-work-tree"
@@ -1960,6 +1977,218 @@ def _lint_worker_end_state_payload(
         normalized_payload["due_cycle"] = due_cycle
 
     return errors, warnings, normalized_payload, worker_report_found
+
+
+def _normalize_required_complexity_delta(
+    value: Any, field_name: str, errors: list[str]
+) -> int | float | str | None:
+    if isinstance(value, bool) or value is None:
+        errors.append(f"`{field_name}` 必须是非空字符串或数值")
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        token = value.strip()
+        if token:
+            return token
+    errors.append(f"`{field_name}` 必须是非空字符串或数值")
+    return None
+
+
+def _find_latest_worker_complexity_impact_payload(workdir: Path) -> tuple[dict[str, Any] | None, list[str], bool]:
+    task_path = workdir / "TASK.md"
+    if not task_path.exists():
+        return None, [], False
+
+    lines, read_errors = _read_task_lines(task_path)
+    if read_errors:
+        return None, read_errors, False
+
+    latest_worker_index = -1
+    for index, raw_line in enumerate(lines):
+        if raw_line.strip().startswith(WORKER_REPORT_HEADER):
+            latest_worker_index = index
+
+    if latest_worker_index < 0:
+        return None, [], False
+
+    for raw_line in reversed(lines[latest_worker_index + 1 :]):
+        line = raw_line.strip()
+        if not line:
+            continue
+        payload_text = _extract_structured_line_payload(line, COMPLEXITY_IMPACT_PREFIX)
+        if payload_text is None:
+            continue
+        try:
+            payload = json.loads(payload_text)
+        except json.JSONDecodeError as exc:
+            return None, [f"`{COMPLEXITY_IMPACT_PREFIX.strip()}` JSON 非法: {exc}"], True
+        if not isinstance(payload, dict):
+            return None, [f"`{COMPLEXITY_IMPACT_PREFIX.strip()}` 载荷必须是 JSON 对象"], True
+        return payload, [], True
+
+    return None, [f"最新 Worker 执行报告缺少 `{COMPLEXITY_IMPACT_PREFIX.strip()}` 复杂度影响声明"], True
+
+
+def _lint_worker_complexity_impact_payload(
+    workdir: Path, *, require_worker_report: bool
+) -> tuple[list[str], list[str], dict[str, Any] | None, bool]:
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    payload, parse_errors, worker_report_found = _find_latest_worker_complexity_impact_payload(workdir)
+    if parse_errors:
+        return parse_errors, warnings, None, worker_report_found
+    if not worker_report_found:
+        if require_worker_report:
+            errors.append(f"缺少 `{WORKER_REPORT_HEADER}`，无法执行复杂度影响机审")
+        return errors, warnings, None, worker_report_found
+    if payload is None:
+        return errors, warnings, None, worker_report_found
+
+    for field_name in COMPLEXITY_IMPACT_REQUIRED_FIELDS:
+        if field_name not in payload:
+            errors.append(f"复杂度影响声明缺少 `{field_name}`")
+
+    change_scope = _normalize_required_nonempty_string(payload.get("change_scope"), "change_scope", errors)
+    complexity_delta = _normalize_required_complexity_delta(payload.get("complexity_delta"), "complexity_delta", errors)
+    runtime_impact = _normalize_required_nonempty_string(payload.get("runtime_impact"), "runtime_impact", errors)
+    maintainability_impact = _normalize_required_nonempty_string(
+        payload.get("maintainability_impact"), "maintainability_impact", errors
+    )
+    risk_level = _normalize_required_nonempty_string(payload.get("risk_level"), "risk_level", errors)
+    evidence_refs = _normalize_required_string_list(payload.get("evidence_refs"), "evidence_refs", errors, allow_empty=False)
+
+    normalized_payload: dict[str, Any] = {
+        "change_scope": change_scope,
+        "complexity_delta": complexity_delta,
+        "runtime_impact": runtime_impact,
+        "maintainability_impact": maintainability_impact,
+        "risk_level": risk_level,
+        "evidence_refs": evidence_refs,
+    }
+    return errors, warnings, normalized_payload, worker_report_found
+
+
+def _find_latest_validator_complexity_review_payload(workdir: Path) -> tuple[dict[str, Any] | None, list[str], bool]:
+    task_path = workdir / "TASK.md"
+    if not task_path.exists():
+        return None, [], False
+
+    lines, read_errors = _read_task_lines(task_path)
+    if read_errors:
+        return None, read_errors, False
+
+    latest_validator_index = -1
+    for index, raw_line in enumerate(lines):
+        if raw_line.strip().startswith(VALIDATOR_REPORT_HEADER):
+            latest_validator_index = index
+
+    if latest_validator_index < 0:
+        return None, [], False
+
+    for raw_line in reversed(lines[latest_validator_index + 1 :]):
+        line = raw_line.strip()
+        if not line:
+            continue
+        payload_text = _extract_structured_line_payload(line, COMPLEXITY_REVIEW_PREFIX)
+        if payload_text is None:
+            continue
+        try:
+            payload = json.loads(payload_text)
+        except json.JSONDecodeError as exc:
+            return None, [f"`{COMPLEXITY_REVIEW_PREFIX.strip()}` JSON 非法: {exc}"], True
+        if not isinstance(payload, dict):
+            return None, [f"`{COMPLEXITY_REVIEW_PREFIX.strip()}` 载荷必须是 JSON 对象"], True
+        return payload, [], True
+
+    return None, [f"最新 Validator 审查报告缺少 `{COMPLEXITY_REVIEW_PREFIX.strip()}` 复杂度复核结论"], True
+
+
+def _is_high_risk_level(value: str) -> bool:
+    token = value.strip().lower()
+    return token in {item.lower() for item in COMPLEXITY_HIGH_RISK_LEVELS}
+
+
+def _lint_validator_complexity_review_payload(
+    workdir: Path,
+    *,
+    require_validator_report: bool,
+    worker_impact_payload: dict[str, Any] | None,
+) -> tuple[list[str], list[str], dict[str, Any] | None, bool]:
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    payload, parse_errors, validator_report_found = _find_latest_validator_complexity_review_payload(workdir)
+    if parse_errors:
+        return parse_errors, warnings, None, validator_report_found
+    if not validator_report_found:
+        if require_validator_report:
+            errors.append(f"缺少 `{VALIDATOR_REPORT_HEADER}`，无法执行复杂度复核机审")
+        return errors, warnings, None, validator_report_found
+    if payload is None:
+        return errors, warnings, None, validator_report_found
+
+    for field_name in COMPLEXITY_REVIEW_REQUIRED_FIELDS:
+        if field_name not in payload:
+            errors.append(f"复杂度复核声明缺少 `{field_name}`")
+
+    decision_raw = _normalize_required_nonempty_string(payload.get("decision"), "decision", errors)
+    decision = decision_raw.lower()
+    if decision and decision not in COMPLEXITY_REVIEW_DECISIONS:
+        errors.append(f"`decision` 非法，必须是 {COMPLEXITY_REVIEW_DECISIONS}")
+
+    risk_level = _normalize_required_nonempty_string(payload.get("risk_level"), "risk_level", errors)
+    reason = _normalize_required_nonempty_string(payload.get("reason"), "reason", errors)
+    required_action = _normalize_required_nonempty_string(payload.get("required_action"), "required_action", errors)
+
+    evidence_refs: list[str] = []
+    if isinstance(worker_impact_payload, dict):
+        refs = worker_impact_payload.get("evidence_refs")
+        if isinstance(refs, list):
+            evidence_refs = [item.strip() for item in refs if isinstance(item, str) and item.strip()]
+
+    if _is_high_risk_level(risk_level):
+        if len(evidence_refs) < COMPLEXITY_HIGH_RISK_MIN_EVIDENCE_REFS and decision != "veto":
+            errors.append("高风险复杂度变更证据不足时，`decision` 必须为 `veto`（Fail-Closed）。")
+
+    if decision == "veto":
+        errors.append("Validator 复杂度复核结论为 `veto`，触发 Fail-Closed 阻断。")
+
+    normalized_payload = {
+        "decision": decision,
+        "risk_level": risk_level,
+        "reason": reason,
+        "required_action": required_action,
+    }
+    return errors, warnings, normalized_payload, validator_report_found
+
+
+def lint_task_complexity_evidence(
+    workdir: Path,
+    *,
+    require_worker_report: bool = False,
+    require_validator_report: bool = False,
+) -> tuple[list[str], list[str], dict[str, Any] | None, dict[str, Any] | None]:
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    worker_errors, worker_warnings, worker_payload, _worker_report_found = _lint_worker_complexity_impact_payload(
+        workdir,
+        require_worker_report=require_worker_report,
+    )
+    errors.extend([f"[COMPLEXITY_IMPACT] {item}" for item in worker_errors])
+    warnings.extend([f"[COMPLEXITY_IMPACT] {item}" for item in worker_warnings])
+
+    review_errors, review_warnings, review_payload, _validator_report_found = _lint_validator_complexity_review_payload(
+        workdir,
+        require_validator_report=require_validator_report,
+        worker_impact_payload=worker_payload,
+    )
+    errors.extend([f"[COMPLEXITY_REVIEW] {item}" for item in review_errors])
+    warnings.extend([f"[COMPLEXITY_REVIEW] {item}" for item in review_warnings])
+
+    return errors, warnings, worker_payload, review_payload
 
 
 def _is_nonempty_string(value: Any) -> bool:

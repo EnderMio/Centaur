@@ -226,6 +226,10 @@ class InitTemplateRegressionTests(unittest.TestCase):
             "风险分级",
             "阻塞项",
             "下一里程碑",
+            "复杂度影响域",
+            "复杂度变化依据",
+            "测试/基准证据",
+            "回滚/缓解动作",
         )
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -271,6 +275,9 @@ class InitTemplateRegressionTests(unittest.TestCase):
             self.assertIn("DISPATCH_DECISION", supervisor_template)
             self.assertIn("SEAL_ONLY", supervisor_template)
             self.assertIn("[CENTAUR_WORKER_END_STATE]", supervisor_template)
+            self.assertIn("[CENTAUR_COMPLEXITY_IMPACT]", supervisor_template)
+            self.assertIn("[CENTAUR_COMPLEXITY_REVIEW]", supervisor_template)
+            self.assertIn("复杂度最小证据标准固定四项", supervisor_template)
             self.assertIn("PATCH_APPLIED", supervisor_template)
             self.assertIn("COMMIT_CREATED", supervisor_template)
             self.assertIn("CARRYOVER_FILES", supervisor_template)
@@ -313,6 +320,9 @@ class InitTemplateRegressionTests(unittest.TestCase):
             self.assertIn("首次失败证据", worker_template)
             self.assertIn("对应动作", worker_template)
             self.assertIn("[CENTAUR_WORKER_END_STATE]", worker_template)
+            self.assertIn("[CENTAUR_COMPLEXITY_IMPACT]", worker_template)
+            self.assertIn("complexity_delta", worker_template)
+            self.assertIn("测试/基准证据", worker_template)
             self.assertIn("COMMIT_CREATED=1", worker_template)
             self.assertIn("SEAL_MODE=SEALED_BLOCKED", worker_template)
             self.assertIn("结构化机审行禁止反引号包裹", worker_template)
@@ -326,6 +336,9 @@ class InitTemplateRegressionTests(unittest.TestCase):
             self.assertIn("[CENTAUR_SUPERVISOR_DISPATCH_GATE]", validator_template)
             self.assertIn("SEAL_ONLY", validator_template)
             self.assertIn("[CENTAUR_WORKER_END_STATE]", validator_template)
+            self.assertIn("[CENTAUR_COMPLEXITY_IMPACT]", validator_template)
+            self.assertIn("[CENTAUR_COMPLEXITY_REVIEW]", validator_template)
+            self.assertIn("decision=veto", validator_template)
             self.assertIn("命中 `PATCH_APPLIED=1` 且 `COMMIT_CREATED=0`", validator_template)
             self.assertNotIn("共享内存权限错误需提权重跑", validator_template)
 
@@ -335,6 +348,10 @@ class InitTemplateRegressionTests(unittest.TestCase):
             self.assertIn("触发场景", project_status_template)
             self.assertIn("验证结论", project_status_template)
             self.assertIn("Librarian 非运行时约束", project_status_template)
+            self.assertIn("复杂度影响域", project_status_template)
+            self.assertIn("复杂度变化依据", project_status_template)
+            self.assertIn("测试/基准证据", project_status_template)
+            self.assertIn("回滚/缓解动作", project_status_template)
 
     def test_init_freeze_prompts_emits_bare_contract_line_and_task_lint_recognizes_it(self) -> None:
         contract_line = (
@@ -460,6 +477,20 @@ class TaskContractLintTests(unittest.TestCase):
         "TASK_KIND": "DIAGNOSE",
         "DISPATCH_DECISION": "ALLOW_FUNCTIONAL",
     }
+    VALID_COMPLEXITY_IMPACT = {
+        "change_scope": "src/centaur/cli.py",
+        "complexity_delta": "O(n) -> O(n)",
+        "runtime_impact": "none",
+        "maintainability_impact": "low",
+        "risk_level": "low",
+        "evidence_refs": ["tests:test_cli.py::TaskContractLintTests"],
+    }
+    VALID_COMPLEXITY_REVIEW = {
+        "decision": "pass",
+        "risk_level": "low",
+        "reason": "evidence sufficient",
+        "required_action": "none",
+    }
 
     @classmethod
     def _worker_end_state_line(cls, overrides: dict[str, object] | None = None) -> str:
@@ -474,6 +505,20 @@ class TaskContractLintTests(unittest.TestCase):
         if overrides:
             payload.update(overrides)
         return "[CENTAUR_SUPERVISOR_DISPATCH_GATE] " + json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+    @classmethod
+    def _complexity_impact_line(cls, overrides: dict[str, object] | None = None) -> str:
+        payload = dict(cls.VALID_COMPLEXITY_IMPACT)
+        if overrides:
+            payload.update(overrides)
+        return "[CENTAUR_COMPLEXITY_IMPACT] " + json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+    @classmethod
+    def _complexity_review_line(cls, overrides: dict[str, object] | None = None) -> str:
+        payload = dict(cls.VALID_COMPLEXITY_REVIEW)
+        if overrides:
+            payload.update(overrides)
+        return "[CENTAUR_COMPLEXITY_REVIEW] " + json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
     @classmethod
     def _write_task_with_worker_end_state(cls, workspace: Path, line: str, gate_line: str | None = None) -> None:
@@ -491,6 +536,12 @@ class TaskContractLintTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+
+    @classmethod
+    def _append_validator_report(cls, workspace: Path, line: str) -> None:
+        with (workspace / "TASK.md").open("a", encoding="utf-8") as handle:
+            handle.write("### Validator 审查报告 (2026-03-06 12:30 +0800)\n")
+            handle.write(f"{line}\n")
 
     def test_task_lint_normalizes_task_md_file_path_argument(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -636,7 +687,8 @@ class TaskContractLintTests(unittest.TestCase):
                     "DISPATCH_DECISION": "SEAL_ONLY",
                 }
             )
-            self._write_task_with_worker_end_state(workspace, self._worker_end_state_line(), gate_line=gate_line)
+            worker_lines = self._worker_end_state_line() + "\n" + self._complexity_impact_line()
+            self._write_task_with_worker_end_state(workspace, worker_lines, gate_line=gate_line)
 
             output_buffer = io.StringIO()
             with redirect_stdout(output_buffer):
@@ -649,7 +701,8 @@ class TaskContractLintTests(unittest.TestCase):
     def test_task_lint_passes_with_valid_worker_end_state_payload(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
-            self._write_task_with_worker_end_state(workspace, self._worker_end_state_line())
+            worker_lines = self._worker_end_state_line() + "\n" + self._complexity_impact_line()
+            self._write_task_with_worker_end_state(workspace, worker_lines)
 
             output_buffer = io.StringIO()
             with redirect_stdout(output_buffer):
@@ -658,6 +711,99 @@ class TaskContractLintTests(unittest.TestCase):
 
             self.assertEqual(rc, 0)
             self.assertIn("结论: PASS", output)
+
+    def test_task_lint_passes_with_valid_complexity_impact_and_review_payloads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            worker_lines = self._worker_end_state_line() + "\n" + self._complexity_impact_line()
+            self._write_task_with_worker_end_state(workspace, worker_lines)
+            self._append_validator_report(workspace, self._complexity_review_line())
+
+            output_buffer = io.StringIO()
+            with redirect_stdout(output_buffer):
+                rc = cli.main(["task", "lint", str(workspace)])
+            output = output_buffer.getvalue()
+
+            self.assertEqual(rc, 0)
+            self.assertIn("结论: PASS", output)
+
+    def test_task_lint_blocks_when_worker_complexity_impact_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            self._write_task_with_worker_end_state(workspace, self._worker_end_state_line())
+
+            output_buffer = io.StringIO()
+            with redirect_stdout(output_buffer):
+                rc = cli.main(["task", "lint", str(workspace)])
+            output = output_buffer.getvalue()
+
+            self.assertEqual(rc, 1)
+            self.assertIn("BLOCKED_SPEC", output)
+            self.assertIn("缺少 `[CENTAUR_COMPLEXITY_IMPACT]`", output)
+
+    def test_task_lint_blocks_when_worker_complexity_impact_json_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            worker_lines = self._worker_end_state_line() + "\n" + "[CENTAUR_COMPLEXITY_IMPACT] {invalid-json"
+            self._write_task_with_worker_end_state(workspace, worker_lines)
+
+            output_buffer = io.StringIO()
+            with redirect_stdout(output_buffer):
+                rc = cli.main(["task", "lint", str(workspace)])
+            output = output_buffer.getvalue()
+
+            self.assertEqual(rc, 1)
+            self.assertIn("BLOCKED_SPEC", output)
+            self.assertIn("[CENTAUR_COMPLEXITY_IMPACT]", output)
+            self.assertIn("JSON 非法", output)
+
+    def test_task_lint_blocks_when_validator_complexity_review_vetoes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            worker_lines = self._worker_end_state_line() + "\n" + self._complexity_impact_line()
+            self._write_task_with_worker_end_state(workspace, worker_lines)
+            self._append_validator_report(workspace, self._complexity_review_line({"decision": "veto"}))
+
+            output_buffer = io.StringIO()
+            with redirect_stdout(output_buffer):
+                rc = cli.main(["task", "lint", str(workspace)])
+            output = output_buffer.getvalue()
+
+            self.assertEqual(rc, 1)
+            self.assertIn("BLOCKED_SPEC", output)
+            self.assertIn("`veto`", output)
+            self.assertIn("Fail-Closed", output)
+
+    def test_task_lint_blocks_high_risk_pass_when_evidence_is_insufficient(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            worker_lines = self._worker_end_state_line() + "\n" + self._complexity_impact_line(
+                {
+                    "risk_level": "high",
+                    "evidence_refs": ["tests:single-proof"],
+                }
+            )
+            self._write_task_with_worker_end_state(workspace, worker_lines)
+            self._append_validator_report(
+                workspace,
+                self._complexity_review_line(
+                    {
+                        "decision": "pass",
+                        "risk_level": "high",
+                        "reason": "insufficient proof but pass",
+                        "required_action": "none",
+                    }
+                ),
+            )
+
+            output_buffer = io.StringIO()
+            with redirect_stdout(output_buffer):
+                rc = cli.main(["task", "lint", str(workspace)])
+            output = output_buffer.getvalue()
+
+            self.assertEqual(rc, 1)
+            self.assertIn("BLOCKED_SPEC", output)
+            self.assertIn("高风险复杂度变更证据不足时，`decision` 必须为 `veto`", output)
 
     def test_task_lint_blocks_backtick_wrapped_worker_end_state_line(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

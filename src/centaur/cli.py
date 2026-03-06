@@ -46,6 +46,7 @@ from centaur.engine import (
     sync_task_bus_to_active,
     task_file_path,
     lint_task_contract,
+    lint_task_complexity_evidence,
     validate_task_name,
 )
 
@@ -615,6 +616,10 @@ def cmd_task_lint(args: argparse.Namespace) -> int:
         end_state_errors, end_state_warnings = _lint_worker_end_state(target_dir / "TASK.md", target_dir)
         errors.extend(end_state_errors)
         warnings.extend(end_state_warnings)
+
+        complexity_errors, complexity_warnings, _impact_payload, _review_payload = lint_task_complexity_evidence(target_dir)
+        errors.extend(complexity_errors)
+        warnings.extend(complexity_warnings)
 
     print(f"🧪 TASK 契约检查: {target_dir / 'TASK.md'}")
     if contract is not None:

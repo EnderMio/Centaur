@@ -57,6 +57,10 @@
 ## 验收标准
 - [ ] ...
 - [ ] ...
+- [ ] Worker 已回填复杂度影响声明（单行结构化 JSON）：
+  [CENTAUR_COMPLEXITY_IMPACT] {"change_scope":"","complexity_delta":"","runtime_impact":"","maintainability_impact":"","risk_level":"","evidence_refs":[]}
+- [ ] Validator 已回填复杂度复核结论（单行结构化 JSON）：
+  [CENTAUR_COMPLEXITY_REVIEW] {"decision":"pass","risk_level":"","reason":"","required_action":""}
 
 ## 机审契约
 [CENTAUR_TASK_CONTRACT] {"version":1,"unit":"set_exact","baseline":"","allowed_delta":[],"forbidden_delta":[],"precedence":["forbidden","allowed","wording"]}
@@ -70,6 +74,7 @@
   - `COMMIT_CREATED=1` 时必须补齐 `commit_sha` 与 `commit_files`
   - `SEAL_MODE=SEALED_BLOCKED` 时必须补齐 `carryover_reason`、`owner`、`next_min_action`、`due_cycle`
   - 若 `PATCH_APPLIED=1` 且 `COMMIT_CREATED=0`，必须提供完整 `SEAL_MODE=SEALED_BLOCKED` 映射；否则 Validator 将硬驳回并阻断推进
+  - 若 `risk_level` 为高风险且证据不足，Validator 必须给出 `decision=veto`（Fail-Closed）
 ```
 
 补充约束：
@@ -82,6 +87,7 @@
 - 当命中 `project.json` 中已登记的项目规则时，必须在当轮 `TASK.md` 写明三要素：`触发条件 / 动作 / 证据要求`。
 - 结构化机审行（如 `[CENTAUR_TASK_CONTRACT]`、`[CENTAUR_SUPERVISOR_DISPATCH_GATE]`）必须裸行写入；禁止反引号包裹与 `$()` 命令替换污染。
 - Worker 反馈区必须明确要求回填 `PATCH_APPLIED`、`COMMIT_CREATED`、`CARRYOVER_FILES`、`SEAL_MODE`、`RELEASE_DECISION` 五个结束态字段。
+- 复杂度最小证据标准固定四项：影响域、复杂度变化依据、测试或基准证据、回滚/缓解动作；不得只写自由文本结论。
 
 ### Step 5: 终端播报与结束 (Terminal Broadcast & Exit)
 完成 `TASK.md` 的覆写后，你必须向终端（标准输出）打印一份标准的【Supervisor 调度总结】，直接回复给人类查看。
