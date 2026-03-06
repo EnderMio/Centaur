@@ -96,10 +96,38 @@ class CLIIntegrationTests(unittest.TestCase):
                 _prompt_mode: str,
                 cycle: int = 0,
                 headless: bool = False,
+                headless_exec_args: list[str] | None = None,
             ) -> None:
                 self.assertTrue(headless)
+                self.assertIsInstance(headless_exec_args, list)
                 normalized_role = role.lower()
                 role_trace.append(normalized_role)
+
+                if normalized_role == "supervisor":
+                    (workdir / "TASK.md").write_text(
+                        (
+                            "# 当前任务 (Task)\n\n"
+                            "## 任务目标\n"
+                            "- headless smoke\n\n"
+                            "## 约束边界\n"
+                            "- integration-test\n\n"
+                            "## 验收标准\n"
+                            "- cycle advances\n\n"
+                            "## 机审契约\n"
+                            '[CENTAUR_TASK_CONTRACT] {"version":1,"unit":"set_exact","baseline":"integration-smoke","allowed_delta":[],"forbidden_delta":[],"precedence":["forbidden","allowed","wording"]}\n'
+                            '[CENTAUR_SUPERVISOR_DISPATCH_GATE] {"STATUS_CMD":"cd /repo && git status --short -- TASK.md","STATUS_RC":0,"STATUS_HAS_UNSEALED_DIRTY":0,"TARGET_DIFF_CMD":"cd /repo && git diff --name-only -- TASK.md","TARGET_DIFF_RC":0,"TARGET_DIFF_HAS_CHANGES":0,"TASK_KIND":"DIAGNOSE","DISPATCH_DECISION":"ALLOW_FUNCTIONAL"}\n'
+                            "---\n"
+                            "## Worker 反馈区\n"
+                        ),
+                        encoding="utf-8",
+                    )
+                elif normalized_role == "worker":
+                    with (workdir / "TASK.md").open("a", encoding="utf-8") as handle:
+                        handle.write("### Worker 执行报告 (integration)\n")
+                        handle.write(
+                            '[CENTAUR_WORKER_END_STATE] {"PATCH_APPLIED":0,"COMMIT_CREATED":0,"CARRYOVER_FILES":[],"SEAL_MODE":"UNSEALED","RELEASE_DECISION":"READY"}\n'
+                        )
+
                 append_event(workdir, cycle=cycle, event_type="role_start", role=normalized_role)
                 append_event(workdir, cycle=cycle, event_type="role_end", role=normalized_role, return_code=0)
 

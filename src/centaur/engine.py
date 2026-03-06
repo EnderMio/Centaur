@@ -81,6 +81,7 @@ COMPLEXITY_REVIEW_DECISIONS = ("pass", "veto")
 COMPLEXITY_HIGH_RISK_LEVELS = ("high", "critical", "高")
 COMPLEXITY_HIGH_RISK_MIN_EVIDENCE_REFS = 2
 SUPERVISOR_DISPATCH_GATE_PREFIX = "[CENTAUR_SUPERVISOR_DISPATCH_GATE] "
+EFFECTIVE_PERMISSION_PREFIX = "[CENTAUR_EFFECTIVE_PERMISSION] "
 SUPERVISOR_DISPATCH_GATE_REQUIRED_FIELDS = (
     "STATUS_CMD",
     "STATUS_RC",
@@ -992,7 +993,14 @@ def codex_available() -> bool:
 
 
 def _emit_runtime_config_error(reason: str, next_step: str) -> None:
+    # 统一错误模板，兼容旧版 RUNTIME_CONFIG_ERROR marker。
+    print(f"[CLI_ERROR] {reason}")
     print(f"[RUNTIME_CONFIG_ERROR] {reason}")
+    print(f"[NEXT_STEP] {next_step}")
+
+
+def _emit_cli_error(reason: str, next_step: str) -> None:
+    print(f"[CLI_ERROR] {reason}")
     print(f"[NEXT_STEP] {next_step}")
 
 
@@ -1079,6 +1087,94 @@ def format_runtime_policy_audit(policy: RuntimePolicy) -> str:
     else:
         exec_mode = f"sandbox={policy.codex_exec_sandbox or DEFAULT_CODEX_EXEC_SANDBOX}"
     return f"human_gate_policy={policy.human_gate_policy}, codex_exec={exec_mode}"
+
+
+def _effective_codex_sandbox(policy: RuntimePolicy) -> str:
+    return policy.codex_exec_sandbox or DEFAULT_CODEX_EXEC_SANDBOX
+
+
+def _resolve_worker_permission_matrix(task_kind: str, policy: RuntimePolicy) -> tuple[bool, str, str, str]:
+    normalized_task_kind = task_kind.strip().upper() or "UNKNOWN"
+    if policy.codex_exec_dangerously_bypass and policy.codex_exec_sandbox is not None:
+        return (
+            False,
+            "matrix:block:conflict_bypass_with_explicit_sandbox",
+            "权限矩阵阻断：`codex_exec_dangerously_bypass=true` 与显式 `codex_exec_sandbox` 冲突。",
+            "删除 `codex_exec_sandbox` 或关闭 `codex_exec_dangerously_bypass` 后重试 `centaur run --headless`。",
+        )
+
+    if policy.codex_exec_dangerously_bypass:
+        return True, "matrix:allow:dangerously_bypass", "", ""
+
+    sandbox = _effective_codex_sandbox(policy)
+    if normalized_task_kind == TASK_KIND_FEATURE and sandbox == "read-only":
+        return (
+            False,
+            "matrix:block:feature_read_only",
+            "权限矩阵阻断：`TASK_KIND=FEATURE` 在 `read-only` sandbox 下禁止执行 Worker。",
+            "将 `.centaur/project.json` 中 `codex_exec_sandbox` 调整为 `workspace-write`，"
+            "或由 Supervisor 将 `TASK_KIND` 改为非 `FEATURE` 后重试。",
+        )
+
+    if normalized_task_kind == TASK_KIND_FEATURE and sandbox == "workspace-write":
+        return True, "matrix:allow:feature_workspace_write", "", ""
+
+    return True, "matrix:allow:default", "", ""
+
+
+def _build_worker_effective_permission_snapshot(
+    workdir: Path,
+    policy: RuntimePolicy,
+) -> tuple[dict[str, Any], bool, str, str]:
+    dispatch_errors, _dispatch_warnings, dispatch_payload = _lint_supervisor_dispatch_gate(workdir, required=False)
+
+    task_kind = "UNKNOWN"
+    if dispatch_payload is not None:
+        raw_task_kind = str(dispatch_payload.get("TASK_KIND", "")).strip().upper()
+        if raw_task_kind:
+            task_kind = raw_task_kind
+
+    effective_flags: list[str] = [f"task_kind={task_kind}"]
+    if dispatch_errors:
+        effective_flags.append("dispatch_gate=missing_or_invalid")
+
+    if policy.codex_exec_dangerously_bypass:
+        effective_flags.append("exec_mode=dangerously_bypass")
+    else:
+        effective_flags.append(f"effective_sandbox={_effective_codex_sandbox(policy)}")
+
+    allowed, matrix_flag, reason, next_step = _resolve_worker_permission_matrix(task_kind, policy)
+    effective_flags.append(matrix_flag)
+
+    snapshot = {
+        "task_kind": task_kind,
+        "human_gate_policy": policy.human_gate_policy,
+        "codex_exec_sandbox": policy.codex_exec_sandbox,
+        "codex_exec_dangerously_bypass": policy.codex_exec_dangerously_bypass,
+        "effective_flags": effective_flags,
+    }
+    return snapshot, allowed, reason, next_step
+
+
+def _print_effective_permission_snapshot(snapshot: dict[str, Any]) -> None:
+    print(f"{EFFECTIVE_PERMISSION_PREFIX}{json.dumps(snapshot, ensure_ascii=False, sort_keys=True)}")
+
+
+def _route_worker_permission_block_and_stop(
+    workdir: Path,
+    state: dict[str, Any],
+    cycle: int,
+    active_task: str,
+    reason: str,
+    next_step: str,
+) -> None:
+    _clear_role_transaction(state)
+    state["cycle"] = cycle
+    state["next_step"] = "worker"
+    save_state(workdir, state)
+    sync_task_bus_to_active(workdir, active_task)
+    _emit_cli_error(reason, next_step)
+    raise SystemExit(1)
 
 
 def _normalize_task_contract_mode(value: Any) -> str:
@@ -3174,6 +3270,21 @@ def run_workflow(
                             active_task=active_task,
                             reasons=contract_errors,
                         )
+
+            permission_snapshot, permission_allowed, permission_reason, permission_next_step = (
+                _build_worker_effective_permission_snapshot(base, runtime_policy)
+            )
+            _print_effective_permission_snapshot(permission_snapshot)
+            if not permission_allowed:
+                _route_worker_permission_block_and_stop(
+                    workdir=base,
+                    state=state,
+                    cycle=cycle,
+                    active_task=active_task,
+                    reason=permission_reason,
+                    next_step=permission_next_step,
+                )
+
             _start_role_transaction(state, role="worker", cycle=cycle)
             save_state(base, state)
             run_id = str(state.get("run_id") or "")

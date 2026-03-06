@@ -17,6 +17,7 @@ from centaur.engine import (  # noqa: E402
     CONTROL_TASKS_FILE,
     DEFAULT_CODEX_EXEC_SANDBOX,
     DEFAULT_TASK_NAME,
+    EFFECTIVE_PERMISSION_PREFIX,
     EVENTS_FILE,
     NON_RUNTIME_GOVERNANCE_ROLES,
     PROJECT_SCHEMA_VERSION,
@@ -108,6 +109,140 @@ class EngineRuntimeTests(unittest.TestCase):
                 }
             )
         self.assertIn("禁止显式设置 `codex_exec_sandbox`", str(cm.exception))
+
+    def _prepare_feature_permission_workspace(
+        self,
+        workspace: Path,
+        *,
+        sandbox: str | None,
+        bypass: bool,
+    ) -> None:
+        (workspace / "PROPOSAL.md").write_text("proposal", encoding="utf-8")
+        (workspace / "TASK.md").write_text(
+            (
+                "# 当前任务 (Task)\n\n"
+                "## 机审契约\n"
+                '[CENTAUR_TASK_CONTRACT] {"version":1,"unit":"set_exact","baseline":"permission-gate","allowed_delta":[],"forbidden_delta":[],"precedence":["forbidden","allowed","wording"]}\n'
+                '[CENTAUR_SUPERVISOR_DISPATCH_GATE] {"STATUS_CMD":"cd /repo && git status --short -- src/centaur/engine.py","STATUS_RC":0,"STATUS_HAS_UNSEALED_DIRTY":0,"TARGET_DIFF_CMD":"cd /repo && git diff --name-only -- src/centaur/engine.py","TARGET_DIFF_RC":0,"TARGET_DIFF_HAS_CHANGES":0,"TASK_KIND":"FEATURE","DISPATCH_DECISION":"ALLOW_FUNCTIONAL"}\n'
+                "---\n"
+                "## Worker 反馈区\n"
+            ),
+            encoding="utf-8",
+        )
+        config = load_or_init_project_config(workspace)
+        config["human_gate_policy"] = "always"
+        config["codex_exec_sandbox"] = sandbox
+        config["codex_exec_dangerously_bypass"] = bypass
+        save_project_config(workspace, config)
+        ensure_runtime_layout(workspace)
+        (workspace / RUNTIME_DIR / "state.json").write_text(
+            json.dumps({"cycle": 2, "next_step": "worker"}),
+            encoding="utf-8",
+        )
+
+    def test_run_workflow_blocks_read_only_feature_before_role_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            self._prepare_feature_permission_workspace(workspace, sandbox="read-only", bypass=False)
+
+            output_buffer = io.StringIO()
+            with patch("centaur.engine.run_agent") as mock_run_agent, redirect_stdout(output_buffer):
+                with self.assertRaises(SystemExit) as cm:
+                    run_workflow(workdir=workspace, start_step="worker", headless=True)
+            output = output_buffer.getvalue()
+
+            self.assertEqual(cm.exception.code, 1)
+            mock_run_agent.assert_not_called()
+            self.assertIn("[CLI_ERROR]", output)
+            self.assertIn("[NEXT_STEP]", output)
+            self.assertIn("TASK_KIND=FEATURE", output)
+            state = json.loads((workspace / RUNTIME_DIR / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["next_step"], "worker")
+            self.assertIsNone(state["inflight_role"])
+            self.assertEqual(state["attempt"], 0)
+
+    def test_run_workflow_permission_block_emits_effective_permission_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            self._prepare_feature_permission_workspace(workspace, sandbox="read-only", bypass=False)
+
+            output_buffer = io.StringIO()
+            with patch("centaur.engine.run_agent"), redirect_stdout(output_buffer):
+                with self.assertRaises(SystemExit):
+                    run_workflow(workdir=workspace, start_step="worker", headless=True)
+            output = output_buffer.getvalue()
+
+            snapshot_line = next((line for line in output.splitlines() if line.startswith(EFFECTIVE_PERMISSION_PREFIX)), "")
+            self.assertTrue(snapshot_line)
+            snapshot = json.loads(snapshot_line[len(EFFECTIVE_PERMISSION_PREFIX) :])
+            self.assertEqual(snapshot["task_kind"], "FEATURE")
+            self.assertEqual(snapshot["human_gate_policy"], "always")
+            self.assertEqual(snapshot["codex_exec_sandbox"], "read-only")
+            self.assertEqual(snapshot["codex_exec_dangerously_bypass"], False)
+            self.assertIn("matrix:block:feature_read_only", snapshot["effective_flags"])
+
+    def test_run_workflow_permission_block_fails_single_shot_without_retry_or_downgrade(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            self._prepare_feature_permission_workspace(workspace, sandbox="read-only", bypass=False)
+
+            output_buffer = io.StringIO()
+            with patch("centaur.engine.run_agent") as mock_run_agent, redirect_stdout(output_buffer):
+                with self.assertRaises(SystemExit) as cm:
+                    run_workflow(workdir=workspace, start_step="worker", headless=True)
+            output = output_buffer.getvalue()
+
+            self.assertEqual(cm.exception.code, 1)
+            mock_run_agent.assert_not_called()
+            self.assertEqual(output.count("[CLI_ERROR]"), 1)
+            self.assertEqual(output.count(EFFECTIVE_PERMISSION_PREFIX), 1)
+            self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", output)
+
+            events_path = workspace / RUNTIME_DIR / EVENTS_FILE
+            events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            started_roles = [event.get("role") for event in events if event.get("event_type") == "role_start"]
+            self.assertNotIn("worker", started_roles)
+
+    def test_run_workflow_allows_feature_with_workspace_write_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            self._prepare_feature_permission_workspace(workspace, sandbox="workspace-write", bypass=False)
+
+            observed: dict[str, object] = {}
+
+            def _fake_run_agent(role: str, *_args, **kwargs) -> None:
+                observed["role"] = role
+                observed["headless_exec_args"] = kwargs.get("headless_exec_args")
+                raise SystemExit(88)
+
+            output_buffer = io.StringIO()
+            with patch("centaur.engine.run_agent", side_effect=_fake_run_agent), redirect_stdout(output_buffer):
+                with self.assertRaises(SystemExit) as cm:
+                    run_workflow(workdir=workspace, start_step="worker", headless=True)
+            output = output_buffer.getvalue()
+
+            self.assertEqual(cm.exception.code, 88)
+            self.assertEqual(observed["role"], "Worker")
+            self.assertEqual(observed["headless_exec_args"], ["--sandbox", "workspace-write"])
+            self.assertIn("matrix:allow:feature_workspace_write", output)
+            self.assertNotIn("[CLI_ERROR]", output)
+
+    def test_run_workflow_blocks_conflicting_bypass_and_sandbox_with_cli_error_template(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            self._prepare_feature_permission_workspace(workspace, sandbox="read-only", bypass=True)
+
+            output_buffer = io.StringIO()
+            with patch("centaur.engine.run_agent") as mock_run_agent, redirect_stdout(output_buffer):
+                with self.assertRaises(SystemExit) as cm:
+                    run_workflow(workdir=workspace, start_step="worker", headless=True)
+            output = output_buffer.getvalue()
+
+            self.assertEqual(cm.exception.code, 1)
+            mock_run_agent.assert_not_called()
+            self.assertIn("[CLI_ERROR]", output)
+            self.assertIn("[NEXT_STEP]", output)
+            self.assertIn("禁止显式设置 `codex_exec_sandbox`", output)
 
     def test_active_task_file_sync(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
