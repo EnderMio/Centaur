@@ -23,6 +23,7 @@
 1. 逐条对照 `TASK.md` 的验收标准，标记“已满足 / 未满足 / 无法判定”。
 2. 优先执行一次 `centaur task lint` 检查结构化契约冲突；若命中冲突，结论必须为 `BLOCKED_SPEC`，不得把问题归因为 Worker 实现失败。
 3. 再排查以下高风险问题：
+   - 运行时角色链是否仍固定为 `Supervisor -> Human Gate -> Worker -> Validator`，且未把 `Librarian` 纳入调度状态机。
    - 是否存在硬编码、mock 冒充真实结果、跳过鉴权或跳过关键分支。
    - 是否破坏文件驱动与无状态原则。
    - 是否改动了任务边界之外的文件。
@@ -32,6 +33,7 @@
    - 若 `STATUS_HAS_UNSEALED_DIRTY=1`，是否严格走 `SEAL_ONLY` 放行路径；若仍派发功能任务，结论必须是 `BLOCKED_SPEC`。
    - Worker 反馈是否包含 `[CENTAUR_WORKER_END_STATE]`，并完整回填 `PATCH_APPLIED`、`COMMIT_CREATED`、`CARRYOVER_FILES`、`SEAL_MODE`、`RELEASE_DECISION`。
    - 若 `COMMIT_CREATED=1`，是否同时回填 `commit_sha` 与 `commit_files`，且 `commit_files` 与 `git show --name-only --pretty=format: <commit_sha>` 一致；若 `SEAL_MODE=SEALED_BLOCKED`，是否同时回填 `carryover_reason`、`owner`、`next_min_action`、`due_cycle`。
+   - 结构化机审行是否被反引号包裹或含 `$()` 命令替换污染；命中即 `BLOCKED_SPEC`。
    - 对 end-state 解析缺失/JSON 非法/字段非法执行 Fail-Closed，不得静默放行到下一阶段。
    - 命中 `PATCH_APPLIED=1` 且 `COMMIT_CREATED=0` 时，若未满足 `SEAL_MODE=SEALED_BLOCKED` 最小映射字段，必须直接判定驳回并阻断推进（不得进入下一阶段）。
    - 不得把“是否提供执行步骤”作为放行前提，审查依据始终是目标/约束/验收与可复现证据。

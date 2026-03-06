@@ -292,6 +292,8 @@ class InitTemplateRegressionTests(unittest.TestCase):
 
             agents_template = (workspace / "AGENTS.md").read_text(encoding="utf-8")
             self.assertIn("## 7. 项目规则维护机制 (Rule Maintenance Mechanism)", agents_template)
+            self.assertIn("Librarian (治理维护者 / 非运行时角色)", agents_template)
+            self.assertIn("不参与调度状态机", agents_template)
             self.assertIn("`project.json`（机器规则）", agents_template)
             self.assertIn("`AGENTS.md`（长期约束）", agents_template)
             self.assertIn("`TASK.md`（当轮强约束）", agents_template)
@@ -300,21 +302,27 @@ class InitTemplateRegressionTests(unittest.TestCase):
 
             supervisor_template = (workspace / "SUPERVISOR.md").read_text(encoding="utf-8")
             self.assertIn("当命中 `project.json` 中已登记的项目规则时", supervisor_template)
+            self.assertIn("`Librarian` 仅用于规则治理", supervisor_template)
+            self.assertIn("结构化机审行（如 `[CENTAUR_TASK_CONTRACT]`", supervisor_template)
             self.assertIn("`触发条件 / 动作 / 证据要求`", supervisor_template)
             self.assertNotIn("共享内存权限错误需提权重跑", supervisor_template)
 
             worker_template = (workspace / "WORKER.md").read_text(encoding="utf-8")
             self.assertIn("若命中 `TASK.md` 已声明的项目规则", worker_template)
+            self.assertIn("`Librarian` 属于非运行时治理角色", worker_template)
             self.assertIn("首次失败证据", worker_template)
             self.assertIn("对应动作", worker_template)
             self.assertIn("[CENTAUR_WORKER_END_STATE]", worker_template)
             self.assertIn("COMMIT_CREATED=1", worker_template)
             self.assertIn("SEAL_MODE=SEALED_BLOCKED", worker_template)
+            self.assertIn("结构化机审行禁止反引号包裹", worker_template)
             self.assertNotIn("共享内存权限错误需提权重跑", worker_template)
 
             validator_template = (workspace / "VALIDATOR.md").read_text(encoding="utf-8")
             self.assertIn("首次失败与后续执行双证据闭环", validator_template)
             self.assertIn("不得仅凭口头描述放行", validator_template)
+            self.assertIn("`Librarian` 纳入调度状态机", validator_template)
+            self.assertIn("反引号包裹或含 `$()` 命令替换污染", validator_template)
             self.assertIn("[CENTAUR_SUPERVISOR_DISPATCH_GATE]", validator_template)
             self.assertIn("SEAL_ONLY", validator_template)
             self.assertIn("[CENTAUR_WORKER_END_STATE]", validator_template)
@@ -326,6 +334,7 @@ class InitTemplateRegressionTests(unittest.TestCase):
             self.assertIn("规则变更内容", project_status_template)
             self.assertIn("触发场景", project_status_template)
             self.assertIn("验证结论", project_status_template)
+            self.assertIn("Librarian 非运行时约束", project_status_template)
 
     def test_init_freeze_prompts_emits_bare_contract_line_and_task_lint_recognizes_it(self) -> None:
         contract_line = (
@@ -649,6 +658,42 @@ class TaskContractLintTests(unittest.TestCase):
 
             self.assertEqual(rc, 0)
             self.assertIn("结论: PASS", output)
+
+    def test_task_lint_blocks_backtick_wrapped_worker_end_state_line(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            wrapped_line = f"`{self._worker_end_state_line()}`"
+            self._write_task_with_worker_end_state(workspace, wrapped_line)
+
+            output_buffer = io.StringIO()
+            with redirect_stdout(output_buffer):
+                rc = cli.main(["task", "lint", str(workspace)])
+            output = output_buffer.getvalue()
+
+            self.assertEqual(rc, 1)
+            self.assertIn("BLOCKED_SPEC", output)
+            self.assertIn("被反引号/引号包裹", output)
+            self.assertIn("[CENTAUR_WORKER_END_STATE]", output)
+
+    def test_task_lint_blocks_command_substitution_polluted_dispatch_gate_line(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            polluted_gate_line = "[CENTAUR_SUPERVISOR_DISPATCH_GATE] $(cat /tmp/fake_gate.json)"
+            self._write_task_with_worker_end_state(
+                workspace,
+                self._worker_end_state_line(),
+                gate_line=polluted_gate_line,
+            )
+
+            output_buffer = io.StringIO()
+            with redirect_stdout(output_buffer):
+                rc = cli.main(["task", "lint", str(workspace)])
+            output = output_buffer.getvalue()
+
+            self.assertEqual(rc, 1)
+            self.assertIn("BLOCKED_SPEC", output)
+            self.assertIn("载荷包含 `$(` 命令替换片段", output)
+            self.assertIn("[CENTAUR_SUPERVISOR_DISPATCH_GATE]", output)
 
     def test_task_lint_requires_worker_end_state_required_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

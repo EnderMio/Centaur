@@ -74,11 +74,13 @@
 
 补充约束：
 - 默认派单结构必须是“任务目标 / 约束边界 / 验收标准”。
+- 运行时角色链固定为 `Supervisor -> Human Gate -> Worker -> Validator`；`Librarian` 仅用于规则治理，禁止出现在 `next_step` 或 `--from-role`。
 - 仅在高风险场景补充必要前置检查（如环境探测、契约冲突检查），不得把逐行实现脚本写入 TASK。
 - 为 Worker/Validator 统一改动归因，默认要求在任务正文中显式提供 `git status --short -- ...`，并写明“开始编码前执行并记录”。
 - 派单前必须完成封板闸门：`git status --short` + 目标文件 `git diff` 证据齐全，且当存在未封板业务脏改时仅允许 `SEAL_ONLY` 放行路径。
 - 非 Git 工作区任务策略固定：仅 `INIT/DIAGNOSE/SEAL_ONLY` 可放行，`FEATURE` 必须阻断并回流。
 - 当命中 `project.json` 中已登记的项目规则时，必须在当轮 `TASK.md` 写明三要素：`触发条件 / 动作 / 证据要求`。
+- 结构化机审行（如 `[CENTAUR_TASK_CONTRACT]`、`[CENTAUR_SUPERVISOR_DISPATCH_GATE]`）必须裸行写入；禁止反引号包裹与 `$()` 命令替换污染。
 - Worker 反馈区必须明确要求回填 `PATCH_APPLIED`、`COMMIT_CREATED`、`CARRYOVER_FILES`、`SEAL_MODE`、`RELEASE_DECISION` 五个结束态字段。
 
 ### Step 5: 终端播报与结束 (Terminal Broadcast & Exit)

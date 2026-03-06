@@ -18,13 +18,16 @@ from centaur.engine import (  # noqa: E402
     DEFAULT_CODEX_EXEC_SANDBOX,
     DEFAULT_TASK_NAME,
     EVENTS_FILE,
+    NON_RUNTIME_GOVERNANCE_ROLES,
     PROJECT_SCHEMA_VERSION,
+    ROLE_ORDER,
     RUNTIME_METRICS_FILE,
     RUNTIME_DIR,
     SCHEDULER_STATE_FILE,
     TASK_CONTRACT_MODE_ENFORCE,
     TASK_COMPLETION_EVIDENCE_PREFIX,
     append_event,
+    append_task_feedback_entry,
     build_codex_exec_permission_args,
     ensure_runtime_layout,
     lint_task_contract,
@@ -446,6 +449,88 @@ class EngineRuntimeTests(unittest.TestCase):
             self.assertIn("`unit=text_exact` 与 `allowed_delta` 冲突", "\n".join(errors))
             self.assertEqual(warnings, [])
             self.assertEqual(contract["unit"], "text_exact")
+
+    def test_runtime_role_chain_excludes_librarian_governance_role(self) -> None:
+        self.assertIn("librarian", NON_RUNTIME_GOVERNANCE_ROLES)
+        self.assertNotIn("librarian", ROLE_ORDER)
+
+    def test_append_task_feedback_entry_appends_only_under_feedback_section(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            task_path = workspace / "TASK.md"
+            task_path.write_text(
+                (
+                    "# 当前任务 (Task)\n\n"
+                    "## 任务目标\n"
+                    "- [ ] demo\n\n"
+                    "---\n"
+                    "## Worker 反馈区\n"
+                    "### Worker 执行报告 (2026-03-06 12:00 +0800)\n"
+                ),
+                encoding="utf-8",
+            )
+
+            append_task_feedback_entry(
+                workspace,
+                '[CENTAUR_ROLE_COMPLETION] {"cycle":1,"role":"worker","run_id":"1-worker-a1","status":"completed"}',
+            )
+
+            content = task_path.read_text(encoding="utf-8")
+            self.assertIn("## Worker 反馈区", content)
+            self.assertTrue(
+                content.rstrip().endswith(
+                    '[CENTAUR_ROLE_COMPLETION] {"cycle":1,"role":"worker","run_id":"1-worker-a1","status":"completed"}'
+                )
+            )
+
+    def test_append_task_feedback_entry_fail_fast_when_feedback_section_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "TASK.md").write_text("# 当前任务 (Task)\n", encoding="utf-8")
+
+            output_buffer = io.StringIO()
+            with redirect_stdout(output_buffer):
+                with self.assertRaises(SystemExit) as cm:
+                    append_task_feedback_entry(workspace, "line")
+            output = output_buffer.getvalue()
+
+            self.assertEqual(cm.exception.code, 1)
+            self.assertIn("缺少 `## Worker 反馈区`", output)
+
+    def test_lint_task_contract_blocks_backtick_wrapped_contract_line(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "TASK.md").write_text(
+                (
+                    "# 当前任务 (Task)\n"
+                    "`[CENTAUR_TASK_CONTRACT] "
+                    '{"version":1,"unit":"set_exact","baseline":"wrapped","allowed_delta":[],"forbidden_delta":[],"precedence":["forbidden","allowed","wording"]}`\n'
+                ),
+                encoding="utf-8",
+            )
+
+            errors, _warnings, contract = lint_task_contract(workspace)
+
+            self.assertIsNone(contract)
+            self.assertIn("被反引号/引号包裹", "\n".join(errors))
+
+    def test_lint_task_contract_blocks_command_substitution_pollution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "TASK.md").write_text(
+                (
+                    "# 当前任务 (Task)\n"
+                    "[CENTAUR_TASK_CONTRACT] $(cat /tmp/fake_contract.json)\n"
+                ),
+                encoding="utf-8",
+            )
+
+            errors, _warnings, contract = lint_task_contract(workspace)
+
+            self.assertIsNone(contract)
+            combined = "\n".join(errors)
+            self.assertIn("命令替换片段", combined)
+            self.assertIn("JSON 非法", combined)
 
     def test_run_workflow_blocks_worker_when_task_contract_conflicts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

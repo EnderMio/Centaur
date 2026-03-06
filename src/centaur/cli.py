@@ -99,6 +99,15 @@ def _read_task_lines(task_path: Path) -> tuple[list[str], list[str]]:
         return [], [f"读取 TASK.md 失败: {exc}"]
 
 
+def _extract_structured_line_payload(line: str, prefix: str) -> str | None:
+    token = prefix.strip()
+    if line.startswith(prefix):
+        return line[len(prefix) :].strip()
+    if line.startswith(token):
+        return line[len(token) :].strip()
+    return None
+
+
 def _run_git(workdir: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["git", *args], cwd=workdir, check=False, capture_output=True, text=True)
 
@@ -153,9 +162,9 @@ def _find_latest_supervisor_dispatch_gate_payload(task_path: Path) -> tuple[dict
 
     for raw_line in reversed(lines):
         line = raw_line.strip()
-        if not line.startswith(SUPERVISOR_DISPATCH_GATE_PREFIX):
+        payload_text = _extract_structured_line_payload(line, SUPERVISOR_DISPATCH_GATE_PREFIX)
+        if payload_text is None:
             continue
-        payload_text = line[len(SUPERVISOR_DISPATCH_GATE_PREFIX) :].strip()
         try:
             payload = json.loads(payload_text)
         except json.JSONDecodeError as exc:
@@ -241,10 +250,9 @@ def _find_latest_worker_end_state_payload(task_path: Path) -> tuple[dict[str, ob
         line = raw_line.strip()
         if not line:
             continue
-        if not line.startswith(WORKER_END_STATE_PREFIX):
+        payload_text = _extract_structured_line_payload(line, WORKER_END_STATE_PREFIX)
+        if payload_text is None:
             continue
-
-        payload_text = line[len(WORKER_END_STATE_PREFIX) :].strip()
         try:
             payload = json.loads(payload_text)
         except json.JSONDecodeError as exc:

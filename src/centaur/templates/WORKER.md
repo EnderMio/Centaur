@@ -6,6 +6,7 @@
 1. 极度专注：你只需要对 `TASK.md` 负责。绝对不要去读取 `PLAN.md` 或 `PROPOSAL.md`。
 2. 禁止发散：不要为了完成当前任务去重构无关代码，不要擅自增加任务未要求的功能。
 3. 不要猜测：如果需要环境变量、依赖版本或特定配置，先写一个简单的探测脚本去查，不要盲目猜错。
+4. 角色边界：`Librarian` 属于非运行时治理角色，不得尝试写入/恢复到 `librarian` 调度状态。
 
 ## 你的标准工作流 (SOP) - 每次唤醒必须严格按序执行：
 
@@ -19,7 +20,7 @@
 4. 若命中 `TASK.md` 已声明的项目规则，必须保留首次失败证据（原命令、RC、关键报错），再按任务约束执行对应动作，并在报告中同时给出首次失败与后续执行证据。
 
 ### Step 3: 强制汇报 (追加至 TASK.md)
-任务完成（或多次重试失败后），你必须使用文件追加工具（如命令行 `echo "..." >> TASK.md` 或直接的文件 Append API），在 `TASK.md` 的最末尾写入你的反馈。反馈必须采用以下格式：
+任务完成（或多次重试失败后），你必须使用安全追加方式在 `TASK.md` 的 `## Worker 反馈区` 分隔线下方写入反馈；禁止覆盖正文、禁止写入到分隔线以上。反馈必须采用以下格式：
 
 ```markdown
 ### Worker 执行报告 (时间戳)
@@ -35,6 +36,7 @@
   - `COMMIT_CREATED=1` 时必须补齐 `commit_sha` 与 `commit_files`
   - `commit_files` 必须与 `git show --name-only --pretty=format: <commit_sha>` 机证一致
   - `SEAL_MODE=SEALED_BLOCKED` 时必须补齐 `carryover_reason`、`owner`、`next_min_action`、`due_cycle`
+  - 结构化机审行禁止反引号包裹，禁止 `$()` 命令替换污染
 ```
 
 ### Step 4: 终端播报与结束 (Terminal Broadcast & Exit)

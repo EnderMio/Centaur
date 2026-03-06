@@ -21,6 +21,7 @@ PROMPT_MODE_INFER_FROZEN_FILES = tuple(name for name in ROLE_TEMPLATE_FILES if n
 REQUIRED_WORKSPACE_FILES = ("PROPOSAL.md",)
 MEMORY_FILES = ("DESIGN.md", "LESSONS.md", "CODE_MAP.md", "PLAN.md", "PROJECT_STATUS.md")
 ROLE_ORDER = ("supervisor", "human_gate", "worker", "validator")
+NON_RUNTIME_GOVERNANCE_ROLES = ("librarian",)
 TRANSACTIONAL_ROLES = ("supervisor", "worker", "validator")
 PROMPT_MODE_GLOBAL = "global"
 PROMPT_MODE_FROZEN = "frozen"
@@ -53,6 +54,8 @@ ROLE_LABELS = {
 TRANSACTION_STATE_FIELDS = ("inflight_role", "run_id", "started_at", "attempt")
 TASK_COMPLETION_EVIDENCE_PREFIX = "[CENTAUR_ROLE_COMPLETION] "
 TASK_CONTRACT_PREFIX = "[CENTAUR_TASK_CONTRACT] "
+TASK_FEEDBACK_SECTION_SEPARATOR = "---"
+TASK_FEEDBACK_SECTION_HEADER = "## Worker 反馈区"
 WORKER_REPORT_HEADER = "### Worker 执行报告"
 WORKER_END_STATE_PREFIX = "[CENTAUR_WORKER_END_STATE] "
 WORKER_END_STATE_REQUIRED_FIELDS = (
@@ -80,6 +83,12 @@ TASK_KIND_SEAL_ONLY = "SEAL_ONLY"
 TASK_KINDS = (TASK_KIND_FEATURE, TASK_KIND_INIT, TASK_KIND_DIAGNOSE, TASK_KIND_SEAL_ONLY)
 NON_GIT_ALLOWED_TASK_KINDS = (TASK_KIND_INIT, TASK_KIND_DIAGNOSE, TASK_KIND_SEAL_ONLY)
 SUPERVISOR_DISPATCH_GATE_DECISIONS = ("ALLOW_FUNCTIONAL", "SEAL_ONLY")
+STRUCTURED_EVIDENCE_PREFIXES = (
+    TASK_CONTRACT_PREFIX,
+    SUPERVISOR_DISPATCH_GATE_PREFIX,
+    WORKER_END_STATE_PREFIX,
+    TASK_COMPLETION_EVIDENCE_PREFIX,
+)
 GIT_WORKTREE_PROBE_CMD = "git rev-parse --is-inside-work-tree"
 GIT_STATUS_WORKTREE_CMD = (
     "git status --porcelain --untracked-files=all -- . "
@@ -195,6 +204,43 @@ def _role_log_filename(role: str) -> str:
 
 def _iso_utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _assert_runtime_role_chain_integrity() -> None:
+    overlap = sorted(set(ROLE_ORDER) & set(NON_RUNTIME_GOVERNANCE_ROLES))
+    if not overlap:
+        return
+    joined = ", ".join(overlap)
+    raise RuntimeError(
+        "运行时角色链配置非法："
+        f"{joined} 属于非运行时治理角色，禁止进入 Supervisor/Worker/Validator 调度链路。"
+    )
+
+
+def _strip_markdown_leading_markers(line: str) -> str:
+    token = line.lstrip()
+    while token:
+        if token.startswith(">"):
+            token = token[1:].lstrip()
+            continue
+        if token.startswith("-") or token.startswith("*"):
+            token = token[1:].lstrip()
+            continue
+        ordered_match = re.match(r"^\d+\.\s+", token)
+        if ordered_match:
+            token = token[ordered_match.end() :].lstrip()
+            continue
+        break
+    return token
+
+
+def _extract_structured_line_payload(line: str, prefix: str) -> str | None:
+    token = prefix.strip()
+    if line.startswith(prefix):
+        return line[len(prefix) :].strip()
+    if line.startswith(token):
+        return line[len(token) :].strip()
+    return None
 
 
 def get_events_path(workdir: Path) -> Path:
@@ -1553,12 +1599,7 @@ def append_task_completion_evidence(workdir: Path, cycle: int, role: str, run_id
         "status": "completed",
     }
     line = f"{TASK_COMPLETION_EVIDENCE_PREFIX}{json.dumps(payload, ensure_ascii=False, sort_keys=True)}\n"
-    try:
-        with task_path.open("a", encoding="utf-8") as handle:
-            handle.write(line)
-    except OSError as exc:
-        print(f"❌ 写入 TASK.md 完成证据失败: {exc}")
-        raise SystemExit(1)
+    append_task_feedback_entry(workdir, line, require_feedback_section=False)
 
 
 def _task_has_completion_evidence(workdir: Path, cycle: int, role: str, run_id: str) -> bool:
@@ -1602,6 +1643,99 @@ def _read_task_lines(task_path: Path) -> tuple[list[str], list[str]]:
         return task_path.read_text(encoding="utf-8").splitlines(), []
     except OSError as exc:
         return [], [f"读取 TASK.md 失败: {exc}"]
+
+
+def _lint_task_structured_line_safety(lines: list[str]) -> list[str]:
+    errors: list[str] = []
+    for line_no, raw_line in enumerate(lines, start=1):
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+
+        candidate = _strip_markdown_leading_markers(stripped)
+        for prefix in STRUCTURED_EVIDENCE_PREFIXES:
+            marker = prefix.strip()
+            if candidate.startswith(f"`{marker}") or candidate.startswith(f"'{marker}") or candidate.startswith(f'"{marker}'):
+                errors.append(f"第 {line_no} 行 `{marker}` 被反引号/引号包裹，禁止包裹结构化机审行。")
+                continue
+            if candidate.startswith("$(") and marker in candidate:
+                errors.append(f"第 {line_no} 行 `{marker}` 命中 `$()` 命令替换污染，已阻断机审。")
+                continue
+
+            payload_text = _extract_structured_line_payload(candidate, prefix)
+            if payload_text is None:
+                continue
+
+            if "$(" in payload_text:
+                errors.append(f"第 {line_no} 行 `{marker}` 载荷包含 `$(` 命令替换片段，已阻断机审。")
+            if "`" in payload_text:
+                errors.append(f"第 {line_no} 行 `{marker}` 载荷包含反引号，已阻断机审。")
+    return errors
+
+
+def _validate_feedback_section_for_safe_append(lines: list[str]) -> list[str]:
+    feedback_index = -1
+    for index, raw_line in enumerate(lines):
+        if raw_line.strip() == TASK_FEEDBACK_SECTION_HEADER:
+            feedback_index = index
+
+    if feedback_index < 0:
+        return [f"缺少 `{TASK_FEEDBACK_SECTION_HEADER}`，无法执行反馈区安全追加"]
+
+    has_separator = any(lines[idx].strip() == TASK_FEEDBACK_SECTION_SEPARATOR for idx in range(feedback_index))
+    if not has_separator:
+        return [f"缺少 `{TASK_FEEDBACK_SECTION_SEPARATOR}` 分隔线，无法确认反馈区边界"]
+
+    for raw_line in lines[feedback_index + 1 :]:
+        stripped = raw_line.strip()
+        if stripped.startswith("## ") and stripped != TASK_FEEDBACK_SECTION_HEADER:
+            return [
+                f"`{TASK_FEEDBACK_SECTION_HEADER}` 后存在额外章节 `{stripped}`，"
+                "拒绝写入以避免覆盖正文。"
+            ]
+    return []
+
+
+def append_task_feedback_entry(workdir: Path, entry: str, *, require_feedback_section: bool = True) -> None:
+    if not isinstance(entry, str) or not entry.strip():
+        print("❌ TASK 反馈区安全追加失败：追加内容不能为空。")
+        raise SystemExit(1)
+
+    task_path = workdir / "TASK.md"
+    if not task_path.exists():
+        print("❌ 缺少 TASK.md，无法写入反馈区。")
+        raise SystemExit(1)
+
+    lines, read_errors = _read_task_lines(task_path)
+    if read_errors:
+        print(f"❌ TASK 反馈区安全追加失败：{read_errors[0]}")
+        raise SystemExit(1)
+
+    has_feedback_section = any(raw_line.strip() == TASK_FEEDBACK_SECTION_HEADER for raw_line in lines)
+    if require_feedback_section or has_feedback_section:
+        section_errors = _validate_feedback_section_for_safe_append(lines)
+        if section_errors:
+            print(f"❌ TASK 反馈区安全追加失败：{section_errors[0]}")
+            raise SystemExit(1)
+
+    normalized = entry if entry.endswith("\n") else f"{entry}\n"
+    try:
+        with task_path.open("a", encoding="utf-8") as handle:
+            handle.write(normalized)
+    except OSError as exc:
+        print(f"❌ TASK 反馈区安全追加失败：{exc}")
+        raise SystemExit(1)
+
+
+def lint_task_structured_line_safety(workdir: Path) -> list[str]:
+    task_path = workdir / "TASK.md"
+    if not task_path.exists():
+        return []
+
+    lines, read_errors = _read_task_lines(task_path)
+    if read_errors:
+        return read_errors
+    return _lint_task_structured_line_safety(lines)
 
 
 def _normalize_required_string_list(value: Any, field_name: str, errors: list[str], *, allow_empty: bool) -> list[str]:
@@ -1653,9 +1787,9 @@ def _find_latest_supervisor_dispatch_gate_payload(workdir: Path) -> tuple[dict[s
 
     for raw_line in reversed(lines):
         line = raw_line.strip()
-        if not line.startswith(SUPERVISOR_DISPATCH_GATE_PREFIX):
+        payload_text = _extract_structured_line_payload(line, SUPERVISOR_DISPATCH_GATE_PREFIX)
+        if payload_text is None:
             continue
-        payload_text = line[len(SUPERVISOR_DISPATCH_GATE_PREFIX) :].strip()
         try:
             payload = json.loads(payload_text)
         except json.JSONDecodeError as exc:
@@ -1741,10 +1875,9 @@ def _find_latest_worker_end_state_payload(workdir: Path) -> tuple[dict[str, Any]
         line = raw_line.strip()
         if not line:
             continue
-        if not line.startswith(WORKER_END_STATE_PREFIX):
+        payload_text = _extract_structured_line_payload(line, WORKER_END_STATE_PREFIX)
+        if payload_text is None:
             continue
-
-        payload_text = line[len(WORKER_END_STATE_PREFIX) :].strip()
         try:
             payload = json.loads(payload_text)
         except json.JSONDecodeError as exc:
@@ -1915,9 +2048,9 @@ def _latest_task_contract_payload(workdir: Path) -> tuple[dict[str, Any] | None,
 
     for raw_line in reversed(lines):
         line = raw_line.strip()
-        if not line.startswith(TASK_CONTRACT_PREFIX):
+        payload_text = _extract_structured_line_payload(line, TASK_CONTRACT_PREFIX)
+        if payload_text is None:
             continue
-        payload_text = line[len(TASK_CONTRACT_PREFIX) :].strip()
         try:
             payload = json.loads(payload_text)
         except json.JSONDecodeError as exc:
@@ -1932,11 +2065,14 @@ def lint_task_contract(workdir: Path) -> tuple[list[str], list[str], dict[str, A
     errors: list[str] = []
     warnings: list[str] = []
 
+    errors.extend(lint_task_structured_line_safety(workdir))
+
     payload, parse_errors = _latest_task_contract_payload(workdir)
     if parse_errors:
-        return parse_errors, warnings, None
+        return errors + parse_errors, warnings, None
     if payload is None:
-        warnings.append(f"TASK.md 未声明 `{TASK_CONTRACT_PREFIX.strip()}` 结构化契约，将沿用自然语言验收。")
+        if not any(TASK_CONTRACT_PREFIX.strip() in item for item in errors):
+            warnings.append(f"TASK.md 未声明 `{TASK_CONTRACT_PREFIX.strip()}` 结构化契约，将沿用自然语言验收。")
         return errors, warnings, None
 
     version = _coerce_int(payload.get("version"))
@@ -2434,6 +2570,10 @@ def migrate_schema(workdir: Path) -> dict[str, Any]:
 def _resolve_start_step(state: dict[str, Any], start_step: str | None) -> dict[str, Any]:
     if start_step is None:
         return state
+    start_token = str(start_step).strip().lower()
+    if start_token in NON_RUNTIME_GOVERNANCE_ROLES:
+        print(f"❌ 非法起始角色: {start_step}（Librarian 属于非运行时治理角色）")
+        raise SystemExit(1)
     if start_step not in ROLE_ORDER:
         print(f"❌ 非法起始角色: {start_step}")
         raise SystemExit(1)
@@ -2652,6 +2792,7 @@ def run_workflow(
     headless: bool = False,
 ) -> None:
     base = (workdir or Path.cwd()).resolve()
+    _assert_runtime_role_chain_integrity()
 
     print("🤖 Codex Agent 2.0 (红蓝对抗版) 已启动！")
     enforce_workspace_guard(base, allow_repo_root=allow_repo_root)
