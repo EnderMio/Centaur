@@ -617,6 +617,100 @@ class EngineRuntimeTests(unittest.TestCase):
             self.assertEqual(observed[1]["inflight_role"], "supervisor")
             self.assertEqual(observed[1]["attempt"], 1)
 
+    def test_run_workflow_blocks_supervisor_progress_when_real_completion_gate_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "PROPOSAL.md").write_text("proposal", encoding="utf-8")
+            (workspace / "TASK.md").write_text("# 当前任务 (Task)\n", encoding="utf-8")
+            load_or_init_project_config(workspace)
+            ensure_runtime_layout(workspace)
+            state_path = workspace / RUNTIME_DIR / "state.json"
+            state_path.write_text(
+                json.dumps({"cycle": 1, "next_step": "supervisor"}),
+                encoding="utf-8",
+            )
+
+            called_roles: list[str] = []
+
+            def _fake_run_agent(role: str, *_args, **_kwargs) -> None:
+                called_roles.append(role)
+                append_event(workspace, cycle=1, event_type="role_end", role="supervisor", return_code=0)
+
+            output_buffer = io.StringIO()
+            with patch("centaur.engine.run_agent", side_effect=_fake_run_agent), redirect_stdout(output_buffer):
+                with self.assertRaises(SystemExit) as cm:
+                    run_workflow(workdir=workspace, headless=True)
+            output = output_buffer.getvalue()
+
+            self.assertEqual(cm.exception.code, 1)
+            self.assertEqual(called_roles, ["Supervisor"])
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(state["cycle"], 1)
+            self.assertEqual(state["next_step"], "supervisor")
+            self.assertIsNone(state["inflight_role"])
+            self.assertIsNone(state["run_id"])
+            self.assertIsNone(state["started_at"])
+            self.assertEqual(state["attempt"], 0)
+
+            self.assertIn("真实完成闸门失败", output)
+            self.assertIn("缺少 Supervisor 派单结构字段", output)
+            evidence_lines = [
+                line
+                for line in (workspace / "TASK.md").read_text(encoding="utf-8").splitlines()
+                if line.startswith(TASK_COMPLETION_EVIDENCE_PREFIX)
+            ]
+            self.assertEqual(evidence_lines, [])
+
+    def test_run_workflow_recovery_keeps_supervisor_replay_when_real_completion_gate_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "PROPOSAL.md").write_text("proposal", encoding="utf-8")
+            run_id = "1-supervisor-a1-recovered"
+            started_at = "2026-03-05T00:00:00+00:00"
+            (workspace / "TASK.md").write_text("# 当前任务 (Task)\n", encoding="utf-8")
+            with (workspace / "TASK.md").open("a", encoding="utf-8") as handle:
+                payload = {"cycle": 1, "role": "supervisor", "run_id": run_id, "status": "completed"}
+                handle.write(f"{TASK_COMPLETION_EVIDENCE_PREFIX}{json.dumps(payload, ensure_ascii=False, sort_keys=True)}\n")
+            load_or_init_project_config(workspace)
+            ensure_runtime_layout(workspace)
+            (workspace / RUNTIME_DIR / "state.json").write_text(
+                json.dumps(
+                    {
+                        "cycle": 1,
+                        "next_step": "supervisor",
+                        "inflight_role": "supervisor",
+                        "run_id": run_id,
+                        "started_at": started_at,
+                        "attempt": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            append_event(workspace, cycle=1, event_type="role_start", role="supervisor")
+            append_event(workspace, cycle=1, event_type="role_end", role="supervisor", return_code=0)
+
+            observed: dict[str, object] = {}
+            called_roles: list[str] = []
+
+            def _fake_run_agent(role: str, *_args, **_kwargs) -> None:
+                called_roles.append(role)
+                observed.update(json.loads((workspace / RUNTIME_DIR / "state.json").read_text(encoding="utf-8")))
+                raise SystemExit(61)
+
+            with patch("centaur.engine.human_gate", side_effect=AssertionError("human_gate should not be entered")), patch(
+                "centaur.engine.run_agent", side_effect=_fake_run_agent
+            ):
+                with self.assertRaises(SystemExit) as cm:
+                    run_workflow(workdir=workspace, headless=True)
+
+            self.assertEqual(cm.exception.code, 61)
+            self.assertEqual(called_roles, ["Supervisor"])
+            self.assertEqual(observed["cycle"], 1)
+            self.assertEqual(observed["next_step"], "supervisor")
+            self.assertEqual(observed["inflight_role"], "supervisor")
+            self.assertEqual(observed["attempt"], 2)
+
     def test_run_workflow_replays_inflight_role_when_last_event_not_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)

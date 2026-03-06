@@ -54,6 +54,12 @@ WORKER_RESULT_SUCCESS = "success"
 WORKER_RESULT_FAILED = "failed"
 WORKER_RESULT_BLOCKED = "blocked"
 WORKER_RESULT_INCOMPLETE = "incomplete"
+SUPERVISOR_TASK_REQUIRED_SECTIONS = (
+    "## 任务目标",
+    "## 约束边界",
+    "## 验收标准",
+    "## Worker 反馈区",
+)
 TASK_CONTRACT_MODE_OFF = "off"
 TASK_CONTRACT_MODE_WARN = "warn"
 TASK_CONTRACT_MODE_ENFORCE = "enforce"
@@ -1354,6 +1360,61 @@ def _classify_worker_outcome(workdir: Path, cycle: int, run_id: str) -> tuple[st
     return WORKER_RESULT_SUCCESS, []
 
 
+def _parse_started_at_utc(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    token = value.strip()
+    if not token:
+        return None
+    try:
+        parsed = datetime.fromisoformat(token)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _verify_supervisor_real_completion(workdir: Path, cycle: int, started_at: Any) -> list[str]:
+    failures: list[str] = []
+    task_path = workdir / "TASK.md"
+    if not task_path.exists():
+        failures.append("真实完成闸门失败：缺少 TASK.md，无法确认 Supervisor 已完成派单。")
+        return failures
+
+    try:
+        task_text = task_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        failures.append(f"真实完成闸门失败：读取 TASK.md 失败: {exc}")
+        return failures
+
+    missing_sections = [marker for marker in SUPERVISOR_TASK_REQUIRED_SECTIONS if marker not in task_text]
+    if missing_sections:
+        failures.append(
+            "真实完成闸门失败：TASK.md 缺少 Supervisor 派单结构字段: " + ", ".join(missing_sections)
+        )
+
+    started_at_dt = _parse_started_at_utc(started_at)
+    if started_at_dt is None:
+        failures.append(
+            "真实完成闸门失败：缺少有效 `started_at`，无法确认 TASK.md 是否在本次 Supervisor 执行窗口内更新。"
+        )
+        return failures
+
+    try:
+        task_mtime = datetime.fromtimestamp(task_path.stat().st_mtime, tz=timezone.utc)
+    except OSError as exc:
+        failures.append(f"真实完成闸门失败：读取 TASK.md 修改时间失败: {exc}")
+        return failures
+
+    if task_mtime.timestamp() < started_at_dt.timestamp() - 1.0:
+        failures.append(
+            "真实完成闸门失败：TASK.md 未在本次 Supervisor 执行窗口内更新 "
+            f"(cycle={cycle}, task_mtime={task_mtime.isoformat()}, started_at={started_at_dt.isoformat()})"
+        )
+    return failures
+
+
 def _verify_role_dual_gate(workdir: Path, cycle: int, role: str, run_id: str) -> list[str]:
     failures: list[str] = []
     if not _has_successful_role_end_event(workdir, cycle=cycle, role=role):
@@ -1499,6 +1560,24 @@ def _recover_inflight_role_state(workdir: Path, state: dict[str, Any]) -> dict[s
     cycle = int(state["cycle"])
     run_id = str(state.get("run_id") or "")
 
+    if inflight_role == "supervisor":
+        completion_failures = _verify_supervisor_real_completion(
+            workdir,
+            cycle=cycle,
+            started_at=state.get("started_at"),
+        )
+        if completion_failures:
+            state["next_step"] = inflight_role
+            return state
+
+        gate_failures = _verify_role_dual_gate(workdir, cycle=cycle, role=inflight_role, run_id=run_id)
+        if gate_failures:
+            state["next_step"] = inflight_role
+            return state
+
+        _apply_success_transition_from_recovered_role(workdir, state, inflight_role, cycle)
+        return state
+
     if inflight_role == "worker":
         outcome, _reasons = _classify_worker_outcome(workdir, cycle=cycle, run_id=run_id)
         if outcome == WORKER_RESULT_SUCCESS:
@@ -1614,7 +1693,23 @@ def run_workflow(
             _start_role_transaction(state, role="supervisor", cycle=cycle)
             save_state(base, state)
             run_id = str(state.get("run_id") or "")
+            started_at = state.get("started_at")
             run_agent("Supervisor", "SUPERVISOR.md", base, prompt_mode, cycle=cycle, headless=headless)
+            completion_failures = _verify_supervisor_real_completion(
+                base,
+                cycle=cycle,
+                started_at=started_at,
+            )
+            if completion_failures:
+                _fail_dual_gate_and_stop(
+                    workdir=base,
+                    state=state,
+                    cycle=cycle,
+                    role="supervisor",
+                    run_id=run_id,
+                    active_task=active_task,
+                    failures=completion_failures,
+                )
             append_task_completion_evidence(base, cycle=cycle, role="supervisor", run_id=run_id)
             gate_failures = _verify_role_dual_gate(base, cycle=cycle, role="supervisor", run_id=run_id)
             if gate_failures:
