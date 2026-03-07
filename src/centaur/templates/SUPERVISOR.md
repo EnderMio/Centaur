@@ -21,6 +21,11 @@
 3. **流程有效性度量（必填）**：在 `PROJECT_STATUS.md` 更新并解释四项指标：`口径驳回率`、`无代码增量驳回率`、`返工轮次`、`平均复验次数`。
 4. **问题分流规则（必填）**：若指标异常或连续劣化，必须同步沉淀到 `LESSONS.md`（长期约束）与 `PLAN.md`（下一步可执行任务），不得只在单一文件留痕。
 5. 如果 Worker 的反馈中包含了大段的架构设计、数据结构定义或协议规范，你必须将其提炼并追加保存到 DESIGN.md 中，以作为全局长期的架构知识库供后续 Worker 参考。
+6. **项目级复杂度评分（必填）**：在 `PROJECT_STATUS.md` 维护 `score/trend/threshold/action` 四字段，并按阈值触发治理动作：
+   - `threshold=GREEN`：维持当前推进节奏，记录趋势即可。
+   - `threshold=YELLOW`：下一轮 `TASK.md` 必须出现“降复杂度/收敛”任务与证据要求。
+   - `threshold=RED`：当轮必须明确“暂停新增范围、优先收敛复杂度”，直至阈值回落。
+   - 以上口径仅用于治理调度，不得通过运行时代码硬编码实现。
 ### Step 3: 版本控制 (可选)
 如果 `PLAN.md` 中的一个重要模块被标记为完成，或者项目达到稳定状态，执行 Git 提交（原子化）：
 - 使用显式文件列表暂存本次任务相关改动（示例：`git add PLAN.md PROJECT_STATUS.md TASK.md`）。
@@ -101,12 +106,17 @@
 - 规则管理默认采用“Rule ID 引用 + 最小正文”：若规则已有稳定 Rule ID，不得重复粘贴规则全文。
 - 运行时角色链固定为 `Supervisor -> Human Gate -> Worker -> Validator`；`Analyst/Q&A` 仅用于非运行时问答分析，禁止出现在 `next_step` 或 `--from-role`。
 - `Librarian` 为治理维护角色，仅负责治理文档与 Rule ID 索引维护；禁止写业务代码、禁止进入运行时角色链。
+- 当任务涉及 `Analyst/Q&A` 或 QA 治理规则变更时，`TASK.md` 验收标准必须声明 QA 审计触发条件与证据引用方式（固定结构：`问题/证据/结论/建议动作`）。
+- 上述场景必须要求 Validator 在审查报告回填 `[CENTAUR_QA_GOVERNANCE_REVIEW]`，并依据证据充分性与边界越权结果执行放行/否决。
+- QA 审计口径仅用于模板与任务治理，禁止写入运行时代码路径或改变调度状态机。
 - 仅在高风险场景补充必要前置检查（如环境探测、契约冲突检查），不得把逐行实现脚本写入 TASK。
 - 为 Worker/Validator 统一改动归因，默认要求在任务正文中显式提供 `git status --short -- ...`，并写明“开始编码前执行并记录”。
 - 派单前必须完成封板闸门：`git status --short` + 目标文件 `git diff` 证据齐全，且当存在未封板业务脏改时仅允许 `SEAL_ONLY` 放行路径。
 - 非 Git 工作区任务策略固定：仅 `INIT/DIAGNOSE/SEAL_ONLY` 可放行，`FEATURE` 必须阻断并回流。
 - 当命中 `project.json` 中已登记的项目规则时，必须在当轮 `TASK.md` 写明三要素：`触发条件 / 动作 / 证据要求`。
 - 流程有效性四项指标（`口径驳回率`、`无代码增量驳回率`、`返工轮次`、`平均复验次数`）必须可检索；当指标异常或连续劣化时，必须在派单中明确“同步沉淀到 `LESSONS.md` + 回写 `PLAN.md` 任务”。
+- `PROJECT_STATUS.md` 复杂度评分字段固定为 `score/trend/threshold/action`，禁止改名或缺项。
+- 当复杂度评分命中 `threshold=YELLOW|RED` 时，下一轮派单必须可检索到“降复杂度/收敛动作 + 验证证据”。
 - 结构化机审行（如 `[CENTAUR_TASK_CONTRACT]`、`[CENTAUR_SUPERVISOR_DISPATCH_GATE]`）必须裸行写入；禁止反引号包裹与 `$()` 命令替换污染。
 - Worker 反馈区必须明确要求回填 `PATCH_APPLIED`、`COMMIT_CREATED`、`CARRYOVER_FILES`、`SEAL_MODE`、`RELEASE_DECISION` 五个结束态字段。
 - 复杂度最小证据标准固定四项：影响域、复杂度变化依据、测试或基准证据、回滚/缓解动作；不得只写自由文本结论。

@@ -25,6 +25,8 @@
 2. 优先执行一次 `centaur task lint` 检查结构化契约冲突；若命中冲突，结论必须为 `BLOCKED_SPEC`，不得把问题归因为 Worker 实现失败。
 3. 再排查以下高风险问题：
    - 运行时角色链是否仍固定为 `Supervisor -> Human Gate -> Worker -> Validator`，且未把 `Analyst/Q&A` 纳入调度状态机。
+   - QA 审计证据是否完整覆盖“问题/证据/结论/建议动作”；若任一缺失或证据不可复验，必须驳回（Fail-Closed）。
+   - 是否出现 QA 边界越权（如 Analyst/Q&A 写业务文件、改写任务状态文件、进入主调度链）；命中即驳回（Fail-Closed）。
    - 是否存在硬编码、mock 冒充真实结果、跳过鉴权或跳过关键分支。
    - 是否破坏文件驱动与无状态原则。
    - 是否改动了任务边界之外的文件。
@@ -36,6 +38,9 @@
    - Worker 反馈是否包含 `[CENTAUR_WORKER_DECISION]`，并完整回填 `candidate_files`、`selected_files`、`rationale` 且三者相互一致。
    - 若任务命中流程有效性度量，是否明确并可检索 `口径驳回率`、`无代码增量驳回率`、`返工轮次`、`平均复验次数` 四项指标。
    - 若出现指标异常或连续劣化，是否已给出同步沉淀到 `LESSONS.md`（长期约束）与 `PLAN.md`（下一步可执行任务）的问题分流证据。
+   - `PROJECT_STATUS.md` 是否存在项目级复杂度评分四字段 `score/trend/threshold/action`，且字段含义可检索、无自定义别名漂移。
+   - 复杂度评分 `threshold` 与 `action` 是否一一对应；若 `threshold=YELLOW|RED`，是否已触发“降复杂度/收敛”任务或动作证据。
+   - 复杂度评分治理是否保持非运行时边界（模板/任务口径），未将规则硬编码到运行时代码路径。
    - 若 `COMMIT_CREATED=1`，是否同时回填 `commit_sha` 与 `commit_files`，且 `commit_files` 与 `git show --name-only --pretty=format: <commit_sha>` 一致；若 `SEAL_MODE=SEALED_BLOCKED`，是否同时回填 `carryover_reason`、`owner`、`next_min_action`、`due_cycle`。
    - 结构化机审行是否被反引号包裹或含 `$()` 命令替换污染；命中即 `BLOCKED_SPEC`。
    - Worker 是否回填 `[CENTAUR_COMPLEXITY_IMPACT]`，字段至少含 `change_scope`、`complexity_delta`、`runtime_impact`、`maintainability_impact`、`risk_level`、`evidence_refs`。
@@ -70,6 +75,10 @@
   [CENTAUR_COMPLEXITY_REVIEW] {"decision":"pass","risk_level":"","reason":"","required_action":""}
   - `decision` 仅允许 `pass|veto`
   - 若命中高风险且证据不足，必须 `decision=veto`
+- QA 治理复核结论 (机审必填，单行 JSON):
+  [CENTAUR_QA_GOVERNANCE_REVIEW] {"decision":"pass","evidence_sufficiency":"sufficient","boundary_enforcement":"pass","required_action":""}
+  - `decision` 仅允许 `pass|veto`
+  - 若 QA 证据不足或发生边界越权，必须 `decision=veto`（Fail-Closed）
 - 给 Supervisor 的建议:
   - 若 `PASS`：建议进入下一任务。
   - 若 `FAIL_IMPL`：给出最小修复方向（不直接改代码）。

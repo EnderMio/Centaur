@@ -235,6 +235,10 @@ class InitTemplateRegressionTests(unittest.TestCase):
             "复杂度变化依据",
             "测试/基准证据",
             "回滚/缓解动作",
+            "score",
+            "trend",
+            "threshold",
+            "action",
         )
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -253,6 +257,8 @@ class InitTemplateRegressionTests(unittest.TestCase):
             self.assertIn("高/中/低", project_status)
             for field in required_fields:
                 self.assertIn(field, project_status)
+            self.assertIn("threshold=YELLOW", project_status)
+            self.assertIn("threshold=RED", project_status)
 
     def test_init_freeze_prompts_writes_goal_constraint_acceptance_supervisor_template(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -303,6 +309,10 @@ class InitTemplateRegressionTests(unittest.TestCase):
             self.assertIn("[~] reason=ABANDONED_DIRECT", supervisor_template)
             self.assertIn("[~] reason=ABANDONED_AFTER_BLOCKED", supervisor_template)
             self.assertIn("历史迁移规则", supervisor_template)
+            self.assertIn("score/trend/threshold/action", supervisor_template)
+            self.assertIn("threshold=YELLOW", supervisor_template)
+            self.assertIn("threshold=RED", supervisor_template)
+            self.assertIn("暂停新增范围", supervisor_template)
 
     def test_init_freeze_prompts_writes_rule_maintenance_mechanism_and_role_guidance(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -323,6 +333,10 @@ class InitTemplateRegressionTests(unittest.TestCase):
             self.assertIn("仅可读取代码、文档与日志", analyst_template)
             self.assertIn("禁止写入业务代码、`TASK.md`、`PROJECT_STATUS.md`", analyst_template)
             self.assertIn("禁止被纳入 `Supervisor -> Human Gate -> Worker -> Validator`", analyst_template)
+            self.assertIn("## QA 审计清单（只读）", analyst_template)
+            self.assertIn("问题 / 证据 / 结论 / 建议动作", analyst_template)
+            self.assertIn("不可写业务文件", analyst_template)
+            self.assertIn("不可进入主调度链", analyst_template)
             self.assertIn("Librarian 核心指令", librarian_template)
             self.assertIn("治理维护专员", librarian_template)
             self.assertIn("仅允许维护治理文档", librarian_template)
@@ -361,6 +375,12 @@ class InitTemplateRegressionTests(unittest.TestCase):
             self.assertIn("`Librarian` 为治理维护角色", supervisor_template)
             self.assertIn("结构化机审行（如 `[CENTAUR_TASK_CONTRACT]`", supervisor_template)
             self.assertIn("`触发条件 / 动作 / 证据要求`", supervisor_template)
+            self.assertIn("score/trend/threshold/action", supervisor_template)
+            self.assertIn("threshold=YELLOW|RED", supervisor_template)
+            self.assertIn("QA 审计触发条件", supervisor_template)
+            self.assertIn("问题/证据/结论/建议动作", supervisor_template)
+            self.assertIn("[CENTAUR_QA_GOVERNANCE_REVIEW]", supervisor_template)
+            self.assertIn("仅用于模板与任务治理", supervisor_template)
             self.assertNotIn("共享内存权限错误需提权重跑", supervisor_template)
 
             worker_template = (workspace / "WORKER.md").read_text(encoding="utf-8")
@@ -396,10 +416,26 @@ class InitTemplateRegressionTests(unittest.TestCase):
             self.assertIn("[CENTAUR_COMPLEXITY_REVIEW]", validator_template)
             self.assertIn("decision=veto", validator_template)
             self.assertIn("命中 `PATCH_APPLIED=1` 且 `COMMIT_CREATED=0`", validator_template)
+            self.assertIn("score/trend/threshold/action", validator_template)
+            self.assertIn("threshold=YELLOW|RED", validator_template)
+            self.assertIn("非运行时边界", validator_template)
+            self.assertIn("QA 审计证据是否完整覆盖", validator_template)
+            self.assertIn("边界越权", validator_template)
+            self.assertIn("[CENTAUR_QA_GOVERNANCE_REVIEW]", validator_template)
+            self.assertIn("若 QA 证据不足或发生边界越权", validator_template)
             self.assertNotIn("共享内存权限错误需提权重跑", validator_template)
 
             project_status_template = (workspace / "PROJECT_STATUS.md").read_text(encoding="utf-8")
             self.assertIn("## 规则变更审计（必填）", project_status_template)
+            self.assertIn("## 项目级复杂度评分基线（必填，治理用途）", project_status_template)
+            self.assertIn("score", project_status_template)
+            self.assertIn("trend", project_status_template)
+            self.assertIn("threshold", project_status_template)
+            self.assertIn("action", project_status_template)
+            self.assertIn("threshold=YELLOW", project_status_template)
+            self.assertIn("threshold=RED", project_status_template)
+            self.assertIn("Supervisor", project_status_template)
+            self.assertIn("Validator", project_status_template)
             self.assertIn("规则变更内容", project_status_template)
             self.assertIn("触发场景", project_status_template)
             self.assertIn("验证结论", project_status_template)
@@ -407,6 +443,9 @@ class InitTemplateRegressionTests(unittest.TestCase):
             self.assertIn("状态注记机读口径", project_status_template)
             self.assertIn("reason=ABANDONED_DIRECT|ABANDONED_AFTER_BLOCKED", project_status_template)
             self.assertIn("历史迁移判定与落地原则", project_status_template)
+            self.assertIn("QA 审计触发条件（非运行时治理）", project_status_template)
+            self.assertIn("QA 审计证据引用（问题/证据/结论/建议动作）", project_status_template)
+            self.assertIn("CENTAUR_QA_GOVERNANCE_REVIEW", project_status_template)
             self.assertIn("复杂度影响域", project_status_template)
             self.assertIn("复杂度变化依据", project_status_template)
             self.assertIn("测试/基准证据", project_status_template)
