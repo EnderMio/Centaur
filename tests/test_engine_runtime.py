@@ -19,6 +19,7 @@ from centaur.engine import (  # noqa: E402
     DEFAULT_TASK_NAME,
     EFFECTIVE_PERMISSION_PREFIX,
     EVENTS_FILE,
+    LOGS_DIR,
     NON_RUNTIME_GOVERNANCE_ROLES,
     PROJECT_SCHEMA_VERSION,
     ROLE_ORDER,
@@ -27,6 +28,7 @@ from centaur.engine import (  # noqa: E402
     SCHEDULER_STATE_FILE,
     TASK_CONTRACT_MODE_ENFORCE,
     TASK_COMPLETION_EVIDENCE_PREFIX,
+    TASK_SESSION_LEDGER_FILE,
     append_event,
     append_task_feedback_entry,
     build_codex_exec_permission_args,
@@ -140,6 +142,34 @@ class EngineRuntimeTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def _prepare_session_ledger_workspace(
+        self,
+        workspace: Path,
+        *,
+        active_task: str = DEFAULT_TASK_NAME,
+        next_step: str = "worker",
+    ) -> None:
+        (workspace / "PROPOSAL.md").write_text("proposal", encoding="utf-8")
+        (workspace / "TASK.md").write_text(
+            "# 当前任务 (Task)\n\n---\n## Worker 反馈区\n",
+            encoding="utf-8",
+        )
+        config = load_or_init_project_config(workspace)
+        config["active_task"] = active_task
+        config["human_gate_policy"] = "risk"
+        save_project_config(workspace, config)
+        ensure_runtime_layout(workspace)
+        (workspace / RUNTIME_DIR / "state.json").write_text(
+            json.dumps({"cycle": 2, "next_step": next_step}),
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _read_session_ledger_entries(workspace: Path) -> list[dict[str, object]]:
+        ledger_path = workspace / RUNTIME_DIR / LOGS_DIR / TASK_SESSION_LEDGER_FILE
+        lines = ledger_path.read_text(encoding="utf-8").splitlines()
+        return [json.loads(line) for line in lines if line.strip()]
+
     def test_run_workflow_blocks_read_only_feature_before_role_execution(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -243,6 +273,162 @@ class EngineRuntimeTests(unittest.TestCase):
             self.assertIn("[CLI_ERROR]", output)
             self.assertIn("[NEXT_STEP]", output)
             self.assertIn("禁止显式设置 `codex_exec_sandbox`", output)
+
+    def test_run_workflow_session_ledger_records_required_fields_for_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            self._prepare_session_ledger_workspace(workspace, next_step="worker")
+
+            def _fake_run_agent(role: str, _prompt_filename: str, workdir: Path, _prompt_mode: str, cycle: int = 0, **_kwargs) -> None:
+                normalized_role = role.lower()
+                append_event(workdir, cycle=cycle, event_type="role_start", role=normalized_role)
+                append_event(workdir, cycle=cycle, event_type="role_end", role=normalized_role, return_code=0)
+                raise SystemExit(99)
+
+            with patch("centaur.engine.run_agent", side_effect=_fake_run_agent):
+                with self.assertRaises(SystemExit) as cm:
+                    run_workflow(workdir=workspace, start_step="worker", headless=True)
+            self.assertEqual(cm.exception.code, 99)
+
+            entries = self._read_session_ledger_entries(workspace)
+            self.assertTrue(entries)
+            worker_entry = next(item for item in reversed(entries) if item["role"] == "worker")
+            for field in ("task_id", "run_id", "session_id", "role", "started_at", "ended_at", "return_code"):
+                self.assertIn(field, worker_entry)
+            self.assertEqual(worker_entry["task_id"], DEFAULT_TASK_NAME)
+            self.assertEqual(worker_entry["role"], "worker")
+            self.assertEqual(worker_entry["return_code"], 0)
+
+    def test_run_workflow_session_ledger_reuses_session_id_within_same_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            self._prepare_session_ledger_workspace(workspace, next_step="supervisor")
+
+            def _fake_run_agent(role: str, _prompt_filename: str, workdir: Path, _prompt_mode: str, cycle: int = 0, **_kwargs) -> None:
+                normalized_role = role.lower()
+                if normalized_role == "supervisor":
+                    (workdir / "TASK.md").write_text(
+                        (
+                            "# 当前任务 (Task)\n\n"
+                            "## 任务目标\n- session ledger smoke\n\n"
+                            "## 约束边界\n- runtime-only\n\n"
+                            "## 验收标准\n- role chain closes\n\n"
+                            "---\n"
+                            "## Worker 反馈区\n"
+                        ),
+                        encoding="utf-8",
+                    )
+                append_event(workdir, cycle=cycle, event_type="role_start", role=normalized_role)
+                append_event(workdir, cycle=cycle, event_type="role_end", role=normalized_role, return_code=0)
+                if normalized_role == "worker":
+                    raise SystemExit(98)
+
+            with patch("centaur.engine.run_agent", side_effect=_fake_run_agent):
+                with self.assertRaises(SystemExit) as cm:
+                    run_workflow(workdir=workspace, headless=True)
+            self.assertEqual(cm.exception.code, 98)
+
+            entries = self._read_session_ledger_entries(workspace)
+            scoped = [item for item in entries if item["role"] in {"supervisor", "worker"}]
+            self.assertGreaterEqual(len(scoped), 2)
+            self.assertEqual(scoped[0]["task_id"], DEFAULT_TASK_NAME)
+            self.assertEqual(scoped[1]["task_id"], DEFAULT_TASK_NAME)
+            self.assertEqual(scoped[0]["session_id"], scoped[1]["session_id"])
+
+    def test_run_workflow_blocks_cross_task_session_reuse_before_worker_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            self._prepare_session_ledger_workspace(workspace, active_task="task-b", next_step="worker")
+            (workspace / RUNTIME_DIR / "state.json").write_text(
+                json.dumps(
+                    {
+                        "cycle": 2,
+                        "next_step": "worker",
+                        "inflight_role": None,
+                        "run_id": None,
+                        "started_at": None,
+                        "attempt": 0,
+                        "session_id": "task-a-2-abcdef123456",
+                        "session_task_id": "task-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            output_buffer = io.StringIO()
+            with patch("centaur.engine.run_agent") as mock_run_agent, redirect_stdout(output_buffer):
+                with self.assertRaises(SystemExit) as cm:
+                    run_workflow(workdir=workspace, start_step="worker", headless=True)
+            output = output_buffer.getvalue()
+
+            self.assertEqual(cm.exception.code, 1)
+            mock_run_agent.assert_not_called()
+            self.assertIn("[CLI_ERROR]", output)
+            self.assertIn("[NEXT_STEP]", output)
+            self.assertIn("任务级会话隔离冲突", output)
+
+            state = json.loads((workspace / RUNTIME_DIR / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["next_step"], "worker")
+            self.assertEqual(state["session_task_id"], "task-a")
+            self.assertEqual(state["session_id"], "task-a-2-abcdef123456")
+
+            events_path = workspace / RUNTIME_DIR / EVENTS_FILE
+            events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            started_roles = [event.get("role") for event in events if event.get("event_type") == "role_start"]
+            self.assertNotIn("worker", started_roles)
+
+    def test_run_workflow_cross_task_session_block_uses_error_template(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            self._prepare_session_ledger_workspace(workspace, active_task="task-b", next_step="worker")
+            (workspace / RUNTIME_DIR / "state.json").write_text(
+                json.dumps(
+                    {
+                        "cycle": 2,
+                        "next_step": "worker",
+                        "session_id": "task-a-2-abcdef123456",
+                        "session_task_id": "task-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            output_buffer = io.StringIO()
+            with redirect_stdout(output_buffer):
+                with self.assertRaises(SystemExit):
+                    run_workflow(workdir=workspace, start_step="worker", headless=True)
+            output = output_buffer.getvalue()
+
+            self.assertIn("[CLI_ERROR]", output)
+            self.assertIn("[NEXT_STEP]", output)
+            self.assertIn("session_id", output)
+
+    def test_run_workflow_cross_task_session_block_single_shot_without_retry_or_downgrade(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            self._prepare_session_ledger_workspace(workspace, active_task="task-b", next_step="worker")
+            (workspace / RUNTIME_DIR / "state.json").write_text(
+                json.dumps(
+                    {
+                        "cycle": 2,
+                        "next_step": "worker",
+                        "session_id": "task-a-2-abcdef123456",
+                        "session_task_id": "task-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            output_buffer = io.StringIO()
+            with patch("centaur.engine.run_agent") as mock_run_agent, redirect_stdout(output_buffer):
+                with self.assertRaises(SystemExit) as cm:
+                    run_workflow(workdir=workspace, start_step="worker", headless=True)
+            output = output_buffer.getvalue()
+
+            self.assertEqual(cm.exception.code, 1)
+            mock_run_agent.assert_not_called()
+            self.assertEqual(output.count("[CLI_ERROR]"), 1)
+            self.assertNotIn("matrix:allow", output)
 
     def test_active_task_file_sync(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

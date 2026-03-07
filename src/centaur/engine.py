@@ -52,6 +52,8 @@ ROLE_LABELS = {
     "validator": "Validator",
 }
 TRANSACTION_STATE_FIELDS = ("inflight_role", "run_id", "started_at", "attempt")
+TASK_SESSION_STATE_FIELDS = ("session_id", "session_task_id")
+TASK_SESSION_LEDGER_FILE = "task_session_ledger.jsonl"
 TASK_COMPLETION_EVIDENCE_PREFIX = "[CENTAUR_ROLE_COMPLETION] "
 TASK_CONTRACT_PREFIX = "[CENTAUR_TASK_CONTRACT] "
 COMPLEXITY_IMPACT_PREFIX = "[CENTAUR_COMPLEXITY_IMPACT] "
@@ -1192,6 +1194,8 @@ def _build_state(cycle: int, next_step: str) -> dict[str, Any]:
         "run_id": None,
         "started_at": None,
         "attempt": 0,
+        "session_id": None,
+        "session_task_id": None,
         "last_checkpoint_sha": None,
     }
 
@@ -1282,6 +1286,33 @@ def _normalize_state(raw: Any) -> dict[str, Any]:
         else:
             attempt = attempt_raw
 
+    if "session_id" not in raw:
+        session_id = None
+    else:
+        session_id_raw = raw.get("session_id")
+        if session_id_raw is None:
+            session_id = None
+        elif isinstance(session_id_raw, str) and session_id_raw.strip():
+            session_id = session_id_raw.strip()
+        else:
+            errors.append(f"`session_id` 非法，必须为非空字符串或 null，当前值={session_id_raw!r}")
+            session_id = None
+
+    if "session_task_id" not in raw:
+        session_task_id = None
+    else:
+        session_task_raw = raw.get("session_task_id")
+        if session_task_raw is None:
+            session_task_id = None
+        elif isinstance(session_task_raw, str) and validate_task_name(session_task_raw.strip()):
+            session_task_id = session_task_raw.strip()
+        else:
+            errors.append(
+                "`session_task_id` 非法，必须为合法任务名或 null，"
+                f"当前值={session_task_raw!r}"
+            )
+            session_task_id = None
+
     if "last_checkpoint_sha" not in raw:
         last_checkpoint_sha = None
     else:
@@ -1314,6 +1345,8 @@ def _normalize_state(raw: Any) -> dict[str, Any]:
                 errors.append("`inflight_role` 非 null 时，`attempt` 必须 >= 1")
             if next_step != inflight_role:
                 errors.append("在途状态不一致：`next_step` 必须与 `inflight_role` 一致")
+        if (session_id is None) != (session_task_id is None):
+            errors.append("`session_id` 与 `session_task_id` 必须同时为 null 或同时为非空")
 
     if errors:
         raise ValueError("; ".join(errors))
@@ -1325,6 +1358,8 @@ def _normalize_state(raw: Any) -> dict[str, Any]:
         "run_id": run_id,
         "started_at": started_at,
         "attempt": attempt,
+        "session_id": session_id,
+        "session_task_id": session_task_id,
         "last_checkpoint_sha": last_checkpoint_sha,
     }
 
@@ -2517,6 +2552,109 @@ def _latest_role_event_signal(workdir: Path, cycle: int, role: str) -> tuple[str
     return None, None
 
 
+def _task_session_ledger_path(workdir: Path) -> Path:
+    ensure_runtime_layout(workdir)
+    return get_logs_dir(workdir) / TASK_SESSION_LEDGER_FILE
+
+
+def _resolve_role_execution_metadata(
+    workdir: Path,
+    cycle: int,
+    role: str,
+    *,
+    fallback_started_at: str,
+    fallback_return_code: int,
+) -> tuple[str, str, int]:
+    started_at = fallback_started_at.strip() if isinstance(fallback_started_at, str) and fallback_started_at.strip() else _iso_utc_now()
+    ended_at = _iso_utc_now()
+    return_code = int(fallback_return_code)
+
+    role_log_path = get_logs_dir(workdir) / f"cycle_{cycle}_{_role_log_filename(role)}"
+    if role_log_path.exists():
+        try:
+            payload = json.loads(role_log_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = None
+        if isinstance(payload, dict):
+            start_token = payload.get("start_time")
+            end_token = payload.get("end_time")
+            return_token = _coerce_int(payload.get("return_code"))
+            if isinstance(start_token, str) and start_token.strip():
+                started_at = start_token.strip()
+            if isinstance(end_token, str) and end_token.strip():
+                ended_at = end_token.strip()
+            if return_token is not None:
+                return_code = return_token
+
+    if return_code == fallback_return_code:
+        event_type, event_return_code = _latest_role_event_signal(workdir, cycle=cycle, role=role)
+        if event_type == "role_end" and event_return_code is not None:
+            return_code = event_return_code
+
+    return started_at, ended_at, return_code
+
+
+def _append_task_session_ledger_entry(
+    workdir: Path,
+    *,
+    task_id: str,
+    run_id: str,
+    session_id: str,
+    role: str,
+    started_at: str,
+    ended_at: str,
+    return_code: int,
+) -> None:
+    payload = {
+        "task_id": task_id,
+        "run_id": run_id,
+        "session_id": session_id,
+        "role": role,
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "return_code": int(return_code),
+    }
+    ledger_path = _task_session_ledger_path(workdir)
+    try:
+        with ledger_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+    except OSError as exc:
+        print(f"❌ 写入任务级会话台账失败: {ledger_path} ({exc})")
+        raise SystemExit(1)
+
+
+def _record_task_session_ledger_entry(
+    workdir: Path,
+    state: dict[str, Any],
+    *,
+    cycle: int,
+    role: str,
+    fallback_return_code: int,
+) -> None:
+    run_token = str(state.get("run_id") or "").strip()
+    session_id, session_task_id = _extract_state_session_binding(state)
+    if not run_token or not session_id or not session_task_id:
+        return
+
+    started_at, ended_at, return_code = _resolve_role_execution_metadata(
+        workdir,
+        cycle=cycle,
+        role=role,
+        fallback_started_at=str(state.get("started_at") or ""),
+        fallback_return_code=fallback_return_code,
+    )
+    _append_task_session_ledger_entry(
+        workdir,
+        task_id=session_task_id,
+        run_id=run_token,
+        session_id=session_id,
+        role=role,
+        started_at=started_at,
+        ended_at=ended_at,
+        return_code=return_code,
+    )
+
+
 def _classify_worker_outcome(workdir: Path, cycle: int, run_id: str) -> tuple[str, list[str]]:
     event_type, return_code = _latest_role_event_signal(workdir, cycle=cycle, role="worker")
     if event_type != "role_end":
@@ -2766,6 +2904,21 @@ def _fail_dual_gate_and_stop(
     raise SystemExit(1)
 
 
+def _route_task_session_isolation_block_and_stop(
+    workdir: Path,
+    state: dict[str, Any],
+    cycle: int,
+    active_task: str,
+    reason: str,
+    next_step: str,
+) -> None:
+    state["cycle"] = cycle
+    save_state(workdir, state)
+    sync_task_bus_to_active(workdir, active_task)
+    _emit_cli_error(reason, next_step)
+    raise SystemExit(1)
+
+
 def _route_blocked_spec_and_stop(
     workdir: Path,
     state: dict[str, Any],
@@ -2916,6 +3069,7 @@ def _apply_success_transition_from_recovered_role(workdir: Path, state: dict[str
         return
     if role == "validator":
         append_event(workdir, cycle=cycle, event_type="cycle_end")
+        _clear_task_session(state)
         state["cycle"] = cycle + 1
         state["next_step"] = "supervisor"
         return
@@ -2983,7 +3137,55 @@ def _recover_inflight_role_state(workdir: Path, state: dict[str, Any]) -> dict[s
     return state
 
 
-def _start_role_transaction(state: dict[str, Any], role: str, cycle: int) -> None:
+def _extract_state_session_binding(state: dict[str, Any]) -> tuple[str, str]:
+    session_id_raw = state.get("session_id")
+    session_task_raw = state.get("session_task_id")
+    session_id = session_id_raw.strip() if isinstance(session_id_raw, str) and session_id_raw.strip() else ""
+    session_task_id = session_task_raw.strip() if isinstance(session_task_raw, str) and session_task_raw.strip() else ""
+    return session_id, session_task_id
+
+
+def _clear_task_session(state: dict[str, Any]) -> None:
+    state["session_id"] = None
+    state["session_task_id"] = None
+
+
+def _ensure_task_session_binding(state: dict[str, Any], task_id: str, cycle: int) -> None:
+    session_id, session_task_id = _extract_state_session_binding(state)
+    if session_id and session_task_id:
+        return
+    if session_id or session_task_id:
+        return
+    state["session_id"] = f"{task_id}-{cycle}-{uuid.uuid4().hex[:12]}"
+    state["session_task_id"] = task_id
+
+
+def _task_session_isolation_conflict(
+    state: dict[str, Any],
+    active_task: str,
+) -> tuple[str, str] | None:
+    session_id, session_task_id = _extract_state_session_binding(state)
+    if not session_id and not session_task_id:
+        return None
+    if not session_id or not session_task_id:
+        return (
+            "任务级会话台账状态损坏：`session_id` 与 `session_task_id` 必须成对出现。",
+            "请回退到 Supervisor 修复状态后重试 `centaur run --headless`。",
+        )
+    if session_task_id == active_task:
+        return None
+    return (
+        "任务级会话隔离冲突："
+        f"active_task={active_task} 试图复用 task_id={session_task_id} 的活跃 session_id={session_id}。",
+        (
+            f"请先切回任务 `{session_task_id}` 完成当前会话，"
+            "或由 Supervisor 结束当前会话后再切换任务。"
+        ),
+    )
+
+
+def _start_role_transaction(state: dict[str, Any], role: str, cycle: int, task_id: str) -> None:
+    _ensure_task_session_binding(state, task_id=task_id, cycle=cycle)
     previous_attempt = _normalize_attempt(state.get("attempt"))
     if state.get("inflight_role") == role and state.get("cycle") == cycle:
         attempt = previous_attempt + 1
@@ -3158,22 +3360,47 @@ def run_workflow(
         print(f"🔐 运行策略: {format_runtime_policy_audit(runtime_policy)}")
         print("█" * 60)
 
+        session_conflict = _task_session_isolation_conflict(state, active_task=active_task)
+        if session_conflict is not None:
+            reason, next_step_hint = session_conflict
+            _route_task_session_isolation_block_and_stop(
+                workdir=base,
+                state=state,
+                cycle=cycle,
+                active_task=active_task,
+                reason=reason,
+                next_step=next_step_hint,
+            )
+
         if next_step == "supervisor":
             if cycle > 1:
                 enforce_next_cycle_git_worktree_guard(base, next_cycle=cycle)
-            _start_role_transaction(state, role="supervisor", cycle=cycle)
+            _start_role_transaction(state, role="supervisor", cycle=cycle, task_id=active_task)
             save_state(base, state)
             run_id = str(state.get("run_id") or "")
             started_at = state.get("started_at")
-            run_agent(
-                "Supervisor",
-                "SUPERVISOR.md",
+            supervisor_error: SystemExit | None = None
+            try:
+                run_agent(
+                    "Supervisor",
+                    "SUPERVISOR.md",
+                    base,
+                    prompt_mode,
+                    cycle=cycle,
+                    headless=headless,
+                    headless_exec_args=headless_exec_args,
+                )
+            except SystemExit as exc:
+                supervisor_error = exc
+            _record_task_session_ledger_entry(
                 base,
-                prompt_mode,
+                state,
                 cycle=cycle,
-                headless=headless,
-                headless_exec_args=headless_exec_args,
+                role="supervisor",
+                fallback_return_code=1 if supervisor_error is not None else 0,
             )
+            if supervisor_error is not None:
+                raise supervisor_error
             completion_failures = _verify_supervisor_real_completion(
                 base,
                 cycle=cycle,
@@ -3285,10 +3512,11 @@ def run_workflow(
                     next_step=permission_next_step,
                 )
 
-            _start_role_transaction(state, role="worker", cycle=cycle)
+            _start_role_transaction(state, role="worker", cycle=cycle, task_id=active_task)
             save_state(base, state)
             run_id = str(state.get("run_id") or "")
             worker_git_before = _capture_git_worktree_snapshot(base)
+            worker_error: SystemExit | None = None
             try:
                 run_agent(
                     "Worker",
@@ -3299,7 +3527,16 @@ def run_workflow(
                     headless=headless,
                     headless_exec_args=headless_exec_args,
                 )
-            except SystemExit:
+            except SystemExit as exc:
+                worker_error = exc
+            _record_task_session_ledger_entry(
+                base,
+                state,
+                cycle=cycle,
+                role="worker",
+                fallback_return_code=1 if worker_error is not None else 0,
+            )
+            if worker_error is not None:
                 outcome, reasons = _classify_worker_outcome(base, cycle=cycle, run_id=run_id)
                 if outcome in {WORKER_RESULT_FAILED, WORKER_RESULT_BLOCKED}:
                     _route_worker_non_success_and_stop(
@@ -3311,7 +3548,7 @@ def run_workflow(
                         outcome=outcome,
                         reasons=reasons,
                     )
-                raise
+                raise worker_error
             worker_git_after = _capture_git_worktree_snapshot(base)
             append_task_completion_evidence(base, cycle=cycle, role="worker", run_id=run_id)
             outcome, reasons = _classify_worker_outcome(base, cycle=cycle, run_id=run_id)
@@ -3342,18 +3579,31 @@ def run_workflow(
             continue
 
         print("\n🔍 Validator 正在审查 Worker 的代码与数据契约...")
-        _start_role_transaction(state, role="validator", cycle=cycle)
+        _start_role_transaction(state, role="validator", cycle=cycle, task_id=active_task)
         save_state(base, state)
         run_id = str(state.get("run_id") or "")
-        run_agent(
-            "Validator",
-            "VALIDATOR.md",
+        validator_error: SystemExit | None = None
+        try:
+            run_agent(
+                "Validator",
+                "VALIDATOR.md",
+                base,
+                prompt_mode,
+                cycle=cycle,
+                headless=headless,
+                headless_exec_args=headless_exec_args,
+            )
+        except SystemExit as exc:
+            validator_error = exc
+        _record_task_session_ledger_entry(
             base,
-            prompt_mode,
+            state,
             cycle=cycle,
-            headless=headless,
-            headless_exec_args=headless_exec_args,
+            role="validator",
+            fallback_return_code=1 if validator_error is not None else 0,
         )
+        if validator_error is not None:
+            raise validator_error
         hard_reject_reasons = _validator_hard_reject_reasons(base)
         if hard_reject_reasons:
             _route_validator_hard_reject_and_stop(
@@ -3376,6 +3626,7 @@ def run_workflow(
                 failures=gate_failures,
             )
         _clear_role_transaction(state)
+        _clear_task_session(state)
         append_event(base, cycle=cycle, event_type="cycle_end")
         state["cycle"] = cycle + 1
         state["next_step"] = "supervisor"
