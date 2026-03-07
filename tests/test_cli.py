@@ -168,6 +168,23 @@ class ErrorTemplateTests(unittest.TestCase):
 
 
 class InitTemplateRegressionTests(unittest.TestCase):
+    def test_init_writes_generic_proposal_template_instead_of_framework_specific_proposal(self) -> None:
+        expected_proposal = files("centaur.templates").joinpath("PROPOSAL.md").read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            output_buffer = io.StringIO()
+            with redirect_stdout(output_buffer):
+                rc = cli.main(["init", str(workspace)])
+            output = output_buffer.getvalue()
+
+            self.assertEqual(rc, 0)
+            self.assertIn("✅ 已初始化", output)
+
+            proposal = (workspace / "PROPOSAL.md").read_text(encoding="utf-8")
+            self.assertEqual(proposal, expected_proposal)
+            self.assertIn("<项目名称>", proposal)
+            self.assertNotIn("v0.1.0-script-baseline", proposal)
+
     def test_init_default_mode_materializes_agents_template(self) -> None:
         expected_agents = files("centaur.templates").joinpath("AGENTS.md").read_text(encoding="utf-8")
         with tempfile.TemporaryDirectory() as tmp:
