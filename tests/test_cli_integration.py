@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from contextlib import redirect_stdout
 import io
 import json
@@ -12,7 +14,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from centaur import cli  # noqa: E402
-from centaur.engine import EVENTS_FILE, RUNTIME_DIR, append_event, sync_task_bus_to_active  # noqa: E402
+from centaur.engine import (  # noqa: E402
+    EVENTS_FILE,
+    RUNTIME_DIR,
+    append_event,
+    load_or_init_project_config,
+    save_project_config,
+    sync_task_bus_to_active,
+)
 
 
 class CLIIntegrationTests(unittest.TestCase):
@@ -84,6 +93,10 @@ class CLIIntegrationTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertIn("已初始化", output)
 
+            config = load_or_init_project_config(workspace)
+            config["human_gate_policy"] = "risk"
+            save_project_config(workspace, config)
+
             role_trace: list[str] = []
             sync_counter = {"value": 0}
             observed_state: dict[str, object] = {}
@@ -131,9 +144,6 @@ class CLIIntegrationTests(unittest.TestCase):
                 append_event(workdir, cycle=cycle, event_type="role_start", role=normalized_role)
                 append_event(workdir, cycle=cycle, event_type="role_end", role=normalized_role, return_code=0)
 
-            def _fake_human_gate() -> None:
-                role_trace.append("human_gate")
-
             def _fake_sync_task_bus_to_active(workdir: Path, active_task: str) -> None:
                 sync_counter["value"] += 1
                 real_sync(workdir, active_task)
@@ -143,15 +153,13 @@ class CLIIntegrationTests(unittest.TestCase):
 
             output_buffer = io.StringIO()
             with patch("centaur.engine.run_agent", side_effect=_fake_run_agent), patch(
-                "centaur.engine.human_gate", side_effect=_fake_human_gate
-            ), patch("centaur.engine.sync_task_bus_to_active", side_effect=_fake_sync_task_bus_to_active), redirect_stdout(
-                output_buffer
-            ):
+                "centaur.engine.sync_task_bus_to_active", side_effect=_fake_sync_task_bus_to_active
+            ), redirect_stdout(output_buffer):
                 with self.assertRaises(SystemExit) as cm:
                     cli.main(["run", str(workspace), "--headless"])
 
             self.assertEqual(cm.exception.code, 91)
-            self.assertEqual(role_trace, ["supervisor", "human_gate", "worker", "validator"])
+            self.assertEqual(role_trace, ["supervisor", "worker", "validator"])
 
             state_path = workspace / RUNTIME_DIR / "state.json"
             state = json.loads(state_path.read_text(encoding="utf-8"))

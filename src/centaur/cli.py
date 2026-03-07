@@ -28,6 +28,7 @@ from centaur.engine import (
     STATE_FILE,
     codex_available,
     collect_prompt_mode_issues,
+    build_codex_exec_headless_args,
     build_codex_exec_permission_args,
     default_project_config,
     ensure_active_task_file,
@@ -711,6 +712,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     infos.append(f"human_gate_policy={runtime_config.get('human_gate_policy', 'always')!r}")
     infos.append(f"codex_exec_sandbox={runtime_config.get('codex_exec_sandbox')!r}")
     infos.append(f"codex_exec_dangerously_bypass={runtime_config.get('codex_exec_dangerously_bypass', False)!r}")
+    infos.append(f"codex_exec_extra_args={runtime_config.get('codex_exec_extra_args', [])!r}")
     try:
         runtime_policy = parse_runtime_policy(runtime_config)
     except ValueError as exc:
@@ -718,6 +720,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     else:
         infos.append(f"runtime_policy={format_runtime_policy_audit(runtime_policy)}")
         infos.append("codex_exec_permission_args=" + " ".join(build_codex_exec_permission_args(runtime_policy)))
+        infos.append("codex_exec_headless_args=" + " ".join(build_codex_exec_headless_args(runtime_policy)))
 
     pm_errors, pm_warnings = collect_prompt_mode_issues(target_dir, prompt_mode)
     errors.extend(pm_errors)

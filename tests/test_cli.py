@@ -66,6 +66,7 @@ class DoctorCommandTests(unittest.TestCase):
             config["human_gate_policy"] = "risk"
             config["codex_exec_sandbox"] = "read-only"
             config["codex_exec_dangerously_bypass"] = False
+            config["codex_exec_extra_args"] = ["--skip-git-repo-check"]
             save_project_config(workspace, config)
             args = argparse.Namespace(path=str(workspace), workspace=None, allow_repo_root=True)
 
@@ -78,7 +79,9 @@ class DoctorCommandTests(unittest.TestCase):
 
             self.assertEqual(rc, 0)
             self.assertIn("runtime_policy=human_gate_policy=risk, codex_exec=sandbox=read-only", output)
+            self.assertIn("codex_exec_extra_args=['--skip-git-repo-check']", output)
             self.assertIn("codex_exec_permission_args=--sandbox read-only", output)
+            self.assertIn("codex_exec_headless_args=--sandbox read-only --skip-git-repo-check", output)
             self.assertIn("结论: PASS", output)
 
     def test_doctor_fails_fast_on_invalid_runtime_policy_config(self) -> None:

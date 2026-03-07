@@ -32,6 +32,7 @@ from centaur.engine import (  # noqa: E402
     TASK_SESSION_LEDGER_FILE,
     append_event,
     append_task_feedback_entry,
+    build_codex_exec_headless_args,
     build_codex_exec_permission_args,
     ensure_runtime_layout,
     lint_task_contract,
@@ -65,6 +66,7 @@ class EngineRuntimeTests(unittest.TestCase):
             self.assertIn("human_gate_policy", config)
             self.assertIn("codex_exec_sandbox", config)
             self.assertIn("codex_exec_dangerously_bypass", config)
+            self.assertIn("codex_exec_extra_args", config)
 
     def test_runtime_policy_parse_and_headless_permission_args(self) -> None:
         cases = (
@@ -74,7 +76,9 @@ class EngineRuntimeTests(unittest.TestCase):
                     "human_gate_policy": "always",
                     "codex_exec_sandbox": "read-only",
                     "codex_exec_dangerously_bypass": False,
+                    "codex_exec_extra_args": [],
                 },
+                ["--sandbox", "read-only"],
                 ["--sandbox", "read-only"],
             ),
             (
@@ -83,8 +87,10 @@ class EngineRuntimeTests(unittest.TestCase):
                     "human_gate_policy": "risk",
                     "codex_exec_sandbox": None,
                     "codex_exec_dangerously_bypass": False,
+                    "codex_exec_extra_args": ["--skip-git-repo-check"],
                 },
                 ["--sandbox", DEFAULT_CODEX_EXEC_SANDBOX],
+                ["--sandbox", DEFAULT_CODEX_EXEC_SANDBOX, "--skip-git-repo-check"],
             ),
             (
                 "dangerously_bypass",
@@ -92,15 +98,18 @@ class EngineRuntimeTests(unittest.TestCase):
                     "human_gate_policy": "off",
                     "codex_exec_sandbox": None,
                     "codex_exec_dangerously_bypass": True,
+                    "codex_exec_extra_args": ["--skip-git-repo-check"],
                 },
                 ["--dangerously-bypass-approvals-and-sandbox"],
+                ["--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check"],
             ),
         )
 
-        for case_name, payload, expected_args in cases:
+        for case_name, payload, expected_permission_args, expected_headless_args in cases:
             with self.subTest(case=case_name):
                 policy = parse_runtime_policy(payload)
-                self.assertEqual(build_codex_exec_permission_args(policy), expected_args)
+                self.assertEqual(build_codex_exec_permission_args(policy), expected_permission_args)
+                self.assertEqual(build_codex_exec_headless_args(policy), expected_headless_args)
 
     def test_runtime_policy_parse_rejects_bypass_and_sandbox_conflict(self) -> None:
         with self.assertRaises(ValueError) as cm:
@@ -112,6 +121,21 @@ class EngineRuntimeTests(unittest.TestCase):
                 }
             )
         self.assertIn("禁止显式设置 `codex_exec_sandbox`", str(cm.exception))
+
+    def test_runtime_policy_parse_rejects_invalid_extra_args(self) -> None:
+        invalid_cases = (
+            ("invalid_type", {"codex_exec_extra_args": "--skip-git-repo-check"}, "`codex_exec_extra_args` 非法"),
+            (
+                "reserved_permission_flag",
+                {"codex_exec_extra_args": ["--sandbox=read-only"]},
+                "`codex_exec_extra_args` 禁止包含权限矩阵参数",
+            ),
+        )
+        for case_name, payload, marker in invalid_cases:
+            with self.subTest(case=case_name):
+                with self.assertRaises(ValueError) as cm:
+                    parse_runtime_policy(payload)
+                self.assertIn(marker, str(cm.exception))
 
     def _prepare_feature_permission_workspace(
         self,
@@ -892,7 +916,7 @@ class EngineRuntimeTests(unittest.TestCase):
             self.assertIn("[BLOCKED_SPEC]", output)
             self.assertIn("centaur task lint", output)
 
-    def test_run_workflow_human_gate_policy_always_enters_gate(self) -> None:
+    def test_run_workflow_human_gate_policy_always_interactive_enters_gate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
             (workspace / "PROPOSAL.md").write_text("proposal", encoding="utf-8")
@@ -914,9 +938,9 @@ class EngineRuntimeTests(unittest.TestCase):
             output_buffer = io.StringIO()
             with patch("centaur.engine.run_agent", side_effect=_fake_run_agent), patch(
                 "centaur.engine.human_gate"
-            ) as mock_gate, redirect_stdout(output_buffer):
+            ) as mock_gate, patch("centaur.engine.has_interactive_tty", return_value=True), redirect_stdout(output_buffer):
                 with self.assertRaises(SystemExit) as cm:
-                    run_workflow(workdir=workspace, headless=True)
+                    run_workflow(workdir=workspace, headless=False)
             output = output_buffer.getvalue()
 
             self.assertEqual(cm.exception.code, 1)
@@ -945,6 +969,8 @@ class EngineRuntimeTests(unittest.TestCase):
 
                     config = load_or_init_project_config(workspace)
                     config["human_gate_policy"] = "risk"
+                    if scenario == "auto_pass":
+                        config["task_contract_mode"] = "off"
                     save_project_config(workspace, config)
                     ensure_runtime_layout(workspace)
                     (workspace / RUNTIME_DIR / "state.json").write_text(
@@ -968,19 +994,98 @@ class EngineRuntimeTests(unittest.TestCase):
                     self.assertEqual(cm.exception.code, 1)
                     self.assertIn("policy=risk", output)
                     if scenario == "trigger":
-                        self.assertEqual(mock_gate.call_count, 1)
+                        self.assertEqual(mock_gate.call_count, 0)
                         mock_run_agent.assert_not_called()
                         self.assertIn("decision=enter_gate", output)
+                        self.assertIn("[CLI_ERROR]", output)
+                        self.assertIn("[NEXT_STEP]", output)
                     else:
                         self.assertEqual(mock_gate.call_count, 0)
+                        mock_run_agent.assert_called_once()
                         self.assertIn("decision=auto_pass", output)
+
+    def test_run_workflow_headless_human_gate_policy_always_fails_fast_with_structured_cli_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "PROPOSAL.md").write_text("proposal", encoding="utf-8")
+            (workspace / "TASK.md").write_text("# 当前任务 (Task)\n", encoding="utf-8")
+            config = load_or_init_project_config(workspace)
+            config["human_gate_policy"] = "always"
+            save_project_config(workspace, config)
+            ensure_runtime_layout(workspace)
+            (workspace / RUNTIME_DIR / "state.json").write_text(
+                json.dumps({"cycle": 2, "next_step": "human_gate"}),
+                encoding="utf-8",
+            )
+
+            output_buffer = io.StringIO()
+            with patch("builtins.input", side_effect=AssertionError("input should not be called")) as mock_input, patch(
+                "centaur.engine.run_agent"
+            ) as mock_run_agent, redirect_stdout(output_buffer):
+                with self.assertRaises(SystemExit) as cm:
+                    run_workflow(workdir=workspace, headless=True)
+            output = output_buffer.getvalue()
+
+            self.assertEqual(cm.exception.code, 1)
+            mock_run_agent.assert_not_called()
+            mock_input.assert_not_called()
+            self.assertIn("policy=always", output)
+            self.assertIn("decision=enter_gate", output)
+            self.assertIn("[CLI_ERROR]", output)
+            self.assertIn("[NEXT_STEP]", output)
+            self.assertNotIn("EOFError", output)
+            state = json.loads((workspace / RUNTIME_DIR / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["next_step"], "human_gate")
+            self.assertIsNone(state["inflight_role"])
+
+    def test_run_workflow_headless_human_gate_policy_risk_trigger_fails_fast_with_structured_cli_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "PROPOSAL.md").write_text("proposal", encoding="utf-8")
+            (workspace / "TASK.md").write_text(
+                (
+                    "# 当前任务 (Task)\n"
+                    "[CENTAUR_TASK_CONTRACT] "
+                    '{"version":1,"unit":"text_exact","allowed_delta":["tests/scripts/test_recovery_auto.sh"]}\n'
+                ),
+                encoding="utf-8",
+            )
+            config = load_or_init_project_config(workspace)
+            config["human_gate_policy"] = "risk"
+            save_project_config(workspace, config)
+            ensure_runtime_layout(workspace)
+            (workspace / RUNTIME_DIR / "state.json").write_text(
+                json.dumps({"cycle": 2, "next_step": "human_gate"}),
+                encoding="utf-8",
+            )
+
+            output_buffer = io.StringIO()
+            with patch("builtins.input", side_effect=AssertionError("input should not be called")) as mock_input, patch(
+                "centaur.engine.run_agent"
+            ) as mock_run_agent, redirect_stdout(output_buffer):
+                with self.assertRaises(SystemExit) as cm:
+                    run_workflow(workdir=workspace, headless=True)
+            output = output_buffer.getvalue()
+
+            self.assertEqual(cm.exception.code, 1)
+            mock_run_agent.assert_not_called()
+            mock_input.assert_not_called()
+            self.assertIn("policy=risk", output)
+            self.assertIn("decision=enter_gate", output)
+            self.assertIn("task_contract_conflict", output)
+            self.assertIn("[CLI_ERROR]", output)
+            self.assertIn("[NEXT_STEP]", output)
+            self.assertNotIn("EOFError", output)
+            state = json.loads((workspace / RUNTIME_DIR / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["next_step"], "human_gate")
+            self.assertIsNone(state["inflight_role"])
 
     def test_run_workflow_human_gate_policy_off_fail_closed_and_skip(self) -> None:
         scenarios = (
-            ("skip_gate", True, 0, "decision=skip_gate"),
-            ("fail_closed", False, 1, "decision=enter_gate_fail_closed"),
+            ("skip_gate", True, 0, "decision=skip_gate", False),
+            ("fail_closed", False, 0, "decision=enter_gate_fail_closed", True),
         )
-        for scenario_name, codex_is_available, expected_gate_calls, expected_decision in scenarios:
+        for scenario_name, codex_is_available, expected_gate_calls, expected_decision, expected_headless_block in scenarios:
             with self.subTest(scenario=scenario_name):
                 with tempfile.TemporaryDirectory() as tmp:
                     workspace = Path(tmp)
@@ -1014,23 +1119,39 @@ class EngineRuntimeTests(unittest.TestCase):
                     self.assertEqual(mock_gate.call_count, expected_gate_calls)
                     self.assertIn("policy=off", output)
                     self.assertIn(expected_decision, output)
+                    if expected_headless_block:
+                        self.assertIn("[CLI_ERROR]", output)
+                        self.assertIn("[NEXT_STEP]", output)
 
     def test_run_workflow_headless_permission_args_follow_runtime_policy(self) -> None:
         cases = (
             (
                 "explicit_sandbox",
-                {"codex_exec_sandbox": "read-only", "codex_exec_dangerously_bypass": False},
+                {"codex_exec_sandbox": "read-only", "codex_exec_dangerously_bypass": False, "codex_exec_extra_args": []},
                 ["--sandbox", "read-only"],
             ),
             (
                 "default_sandbox",
-                {"codex_exec_sandbox": None, "codex_exec_dangerously_bypass": False},
+                {"codex_exec_sandbox": None, "codex_exec_dangerously_bypass": False, "codex_exec_extra_args": []},
                 ["--sandbox", DEFAULT_CODEX_EXEC_SANDBOX],
             ),
             (
                 "dangerously_bypass",
-                {"codex_exec_sandbox": None, "codex_exec_dangerously_bypass": True},
-                ["--dangerously-bypass-approvals-and-sandbox"],
+                {
+                    "codex_exec_sandbox": None,
+                    "codex_exec_dangerously_bypass": True,
+                    "codex_exec_extra_args": ["--skip-git-repo-check"],
+                },
+                ["--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check"],
+            ),
+            (
+                "sandbox_with_extra_args",
+                {
+                    "codex_exec_sandbox": "workspace-write",
+                    "codex_exec_dangerously_bypass": False,
+                    "codex_exec_extra_args": ["--skip-git-repo-check"],
+                },
+                ["--sandbox", "workspace-write", "--skip-git-repo-check"],
             ),
         )
         for case_name, policy_updates, expected_exec_args in cases:
@@ -1070,6 +1191,16 @@ class EngineRuntimeTests(unittest.TestCase):
                 "bypass_conflicts_with_sandbox",
                 {"codex_exec_dangerously_bypass": True, "codex_exec_sandbox": "read-only"},
                 "禁止显式设置 `codex_exec_sandbox`",
+            ),
+            (
+                "extra_args_not_list",
+                {"codex_exec_extra_args": "--skip-git-repo-check"},
+                "`codex_exec_extra_args` 非法，必须是字符串数组或 null",
+            ),
+            (
+                "extra_args_contains_reserved_permission_flag",
+                {"codex_exec_extra_args": ["--sandbox=read-only"]},
+                "`codex_exec_extra_args` 禁止包含权限矩阵参数",
             ),
         )
         for case_name, updates, marker in invalid_cases:

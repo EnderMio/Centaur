@@ -147,6 +147,10 @@ HUMAN_GATE_POLICIES = (
 )
 CODEX_EXEC_SANDBOX_VALUES = ("read-only", "workspace-write", "danger-full-access")
 DEFAULT_CODEX_EXEC_SANDBOX = "workspace-write"
+CODEX_EXEC_RESERVED_EXTRA_ARG_PREFIXES = (
+    "--sandbox",
+    "--dangerously-bypass-approvals-and-sandbox",
+)
 
 
 @dataclass(frozen=True)
@@ -154,6 +158,7 @@ class RuntimePolicy:
     human_gate_policy: str
     codex_exec_sandbox: str | None
     codex_exec_dangerously_bypass: bool
+    codex_exec_extra_args: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -847,6 +852,7 @@ def default_project_config(prompt_mode: str | None = None) -> dict[str, Any]:
         "human_gate_policy": HUMAN_GATE_POLICY_ALWAYS,
         "codex_exec_sandbox": None,
         "codex_exec_dangerously_bypass": False,
+        "codex_exec_extra_args": [],
     }
 
 
@@ -894,6 +900,7 @@ def _normalize_project_config(raw: dict[str, Any], fallback_mode: str) -> dict[s
     human_gate_policy = raw.get("human_gate_policy", HUMAN_GATE_POLICY_ALWAYS)
     codex_exec_sandbox = raw["codex_exec_sandbox"] if "codex_exec_sandbox" in raw else None
     codex_exec_dangerously_bypass = raw.get("codex_exec_dangerously_bypass", False)
+    codex_exec_extra_args = raw["codex_exec_extra_args"] if "codex_exec_extra_args" in raw else []
 
     return {
         "schema_version": PROJECT_SCHEMA_VERSION,
@@ -909,6 +916,7 @@ def _normalize_project_config(raw: dict[str, Any], fallback_mode: str) -> dict[s
         "human_gate_policy": human_gate_policy,
         "codex_exec_sandbox": codex_exec_sandbox,
         "codex_exec_dangerously_bypass": codex_exec_dangerously_bypass,
+        "codex_exec_extra_args": codex_exec_extra_args,
     }
 
 
@@ -1013,6 +1021,33 @@ def _normalize_policy_token(value: Any) -> str | None:
     return token if token else None
 
 
+def _normalize_codex_exec_extra_args(raw_value: Any, errors: list[str]) -> tuple[str, ...]:
+    if raw_value is None:
+        return ()
+    if not isinstance(raw_value, list):
+        errors.append(f"`codex_exec_extra_args` 非法，必须是字符串数组或 null，当前值={raw_value!r}")
+        return ()
+
+    normalized: list[str] = []
+    for index, item in enumerate(raw_value):
+        if not isinstance(item, str) or not item.strip():
+            errors.append(f"`codex_exec_extra_args[{index}]` 非法，必须是非空字符串，当前值={item!r}")
+            continue
+        token = item.strip()
+        lowered = token.lower()
+        if any(
+            lowered == prefix or lowered.startswith(f"{prefix}=") for prefix in CODEX_EXEC_RESERVED_EXTRA_ARG_PREFIXES
+        ):
+            errors.append(
+                "`codex_exec_extra_args` 禁止包含权限矩阵参数 "
+                f"{CODEX_EXEC_RESERVED_EXTRA_ARG_PREFIXES}，请改用 `codex_exec_sandbox` / "
+                "`codex_exec_dangerously_bypass`。"
+            )
+            continue
+        normalized.append(token)
+    return tuple(normalized)
+
+
 def parse_runtime_policy(config: dict[str, Any]) -> RuntimePolicy:
     errors: list[str] = []
 
@@ -1054,6 +1089,8 @@ def parse_runtime_policy(config: dict[str, Any]) -> RuntimePolicy:
             "请删除 sandbox 或关闭 bypass"
         )
 
+    extra_args = _normalize_codex_exec_extra_args(config.get("codex_exec_extra_args", []), errors)
+
     if errors:
         raise ValueError("; ".join(errors))
 
@@ -1061,6 +1098,7 @@ def parse_runtime_policy(config: dict[str, Any]) -> RuntimePolicy:
         human_gate_policy=policy_token,
         codex_exec_sandbox=sandbox_token,
         codex_exec_dangerously_bypass=bypass_enabled,
+        codex_exec_extra_args=extra_args,
     )
 
 
@@ -1081,6 +1119,10 @@ def build_codex_exec_permission_args(policy: RuntimePolicy) -> list[str]:
 
     sandbox = policy.codex_exec_sandbox or DEFAULT_CODEX_EXEC_SANDBOX
     return ["--sandbox", sandbox]
+
+
+def build_codex_exec_headless_args(policy: RuntimePolicy) -> list[str]:
+    return [*build_codex_exec_permission_args(policy), *policy.codex_exec_extra_args]
 
 
 def format_runtime_policy_audit(policy: RuntimePolicy) -> str:
@@ -1153,6 +1195,7 @@ def _build_worker_effective_permission_snapshot(
         "human_gate_policy": policy.human_gate_policy,
         "codex_exec_sandbox": policy.codex_exec_sandbox,
         "codex_exec_dangerously_bypass": policy.codex_exec_dangerously_bypass,
+        "codex_exec_extra_args": list(policy.codex_exec_extra_args),
         "effective_flags": effective_flags,
     }
     return snapshot, allowed, reason, next_step
@@ -1173,6 +1216,23 @@ def _route_worker_permission_block_and_stop(
     _clear_role_transaction(state)
     state["cycle"] = cycle
     state["next_step"] = "worker"
+    save_state(workdir, state)
+    sync_task_bus_to_active(workdir, active_task)
+    _emit_cli_error(reason, next_step)
+    raise SystemExit(1)
+
+
+def _route_headless_human_gate_block_and_stop(
+    workdir: Path,
+    state: dict[str, Any],
+    cycle: int,
+    active_task: str,
+    reason: str,
+    next_step: str,
+) -> None:
+    _clear_role_transaction(state)
+    state["cycle"] = cycle
+    state["next_step"] = "human_gate"
     save_state(workdir, state)
     sync_task_bus_to_active(workdir, active_task)
     _emit_cli_error(reason, next_step)
@@ -3041,6 +3101,8 @@ def migrate_schema(workdir: Path) -> dict[str, Any]:
         config["codex_exec_sandbox"] = None
     if "codex_exec_dangerously_bypass" not in config:
         config["codex_exec_dangerously_bypass"] = False
+    if "codex_exec_extra_args" not in config:
+        config["codex_exec_extra_args"] = []
     save_project_config(workdir, config)
     return config
 
@@ -3348,7 +3410,7 @@ def run_workflow(
     active_cycle: int | None = None
     while True:
         _project_config, active_task, prompt_mode, task_contract_mode, runtime_policy = _load_runtime_settings(base)
-        headless_exec_args = build_codex_exec_permission_args(runtime_policy) if headless else None
+        headless_exec_args = build_codex_exec_headless_args(runtime_policy) if headless else None
         cycle = int(state["cycle"])
         next_step = str(state["next_step"])
         if active_cycle != cycle:
@@ -3442,6 +3504,21 @@ def run_workflow(
                     decision="enter_gate",
                     evidence=["trigger:policy=always"],
                 )
+                if headless:
+                    _route_headless_human_gate_block_and_stop(
+                        workdir=base,
+                        state=state,
+                        cycle=cycle,
+                        active_task=active_task,
+                        reason=(
+                            "headless 模式阻断：`human_gate_policy=always` 需要人工交互确认，"
+                            "禁止在非交互 stdin 下进入 Human Gate。"
+                        ),
+                        next_step=(
+                            "请在交互终端运行 `centaur run` 完成人工放行，"
+                            "或由 Supervisor 调整 `human_gate_policy` 后重试 `centaur run --headless`。"
+                        ),
+                    )
                 human_gate()
             elif runtime_policy.human_gate_policy == HUMAN_GATE_POLICY_RISK:
                 should_gate, evidence = _evaluate_risk_policy(base, task_contract_mode)
@@ -3452,6 +3529,21 @@ def run_workflow(
                     evidence=evidence,
                 )
                 if should_gate:
+                    if headless:
+                        _route_headless_human_gate_block_and_stop(
+                            workdir=base,
+                            state=state,
+                            cycle=cycle,
+                            active_task=active_task,
+                            reason=(
+                                "headless 模式阻断：`human_gate_policy=risk` 命中 gate 触发信号，"
+                                "必须先进行人工确认。"
+                            ),
+                            next_step=(
+                                "请在交互终端运行 `centaur run` 处理 Human Gate，"
+                                "或由 Supervisor 消除风险触发信号后重试 `centaur run --headless`。"
+                            ),
+                        )
                     human_gate()
                 else:
                     print("🟢 risk 模式信号全部通过，自动放行 Worker。")
@@ -3473,6 +3565,21 @@ def run_workflow(
                         evidence=blockers + passed_checks,
                     )
                     print("⚠️ off 模式前置安全条件不满足，已回退进入 Human Gate（Fail-Closed）。")
+                    if headless:
+                        _route_headless_human_gate_block_and_stop(
+                            workdir=base,
+                            state=state,
+                            cycle=cycle,
+                            active_task=active_task,
+                            reason=(
+                                "headless 模式阻断：`human_gate_policy=off` 前置安全检查失败，"
+                                "已 fail-closed 回退到 Human Gate。"
+                            ),
+                            next_step=(
+                                "请在交互终端运行 `centaur run` 完成人工确认，"
+                                "或修复前置检查失败项后再执行 `centaur run --headless`。"
+                            ),
+                        )
                     human_gate()
             state["next_step"] = "worker"
             save_state(base, state)
