@@ -24,7 +24,7 @@
 1. 逐条对照 `TASK.md` 的验收标准，按“结果达成 + 边界遵守”标记“已满足 / 未满足 / 无法判定”。
 2. 优先执行一次 `centaur task lint` 检查结构化契约冲突；若命中冲突，结论必须为 `BLOCKED_SPEC`，不得把问题归因为 Worker 实现失败。
 3. 再排查以下高风险问题：
-   - 运行时角色链是否仍固定为 `Supervisor -> Human Gate -> Worker -> Validator`，且未把 `Librarian` 纳入调度状态机。
+   - 运行时角色链是否仍固定为 `Supervisor -> Human Gate -> Worker -> Validator`，且未把 `Analyst/Q&A` 纳入调度状态机。
    - 是否存在硬编码、mock 冒充真实结果、跳过鉴权或跳过关键分支。
    - 是否破坏文件驱动与无状态原则。
    - 是否改动了任务边界之外的文件。

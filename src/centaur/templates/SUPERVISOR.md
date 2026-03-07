@@ -12,7 +12,11 @@
 1. **更新 `PROJECT_STATUS.md`**：记录新的里程碑、更新架构决策、记录 Worker 报告的全局性技术债或无法解决的 Bug。
 2. **维护 `PLAN.md`**（必须使用规范的 Markdown Checkbox）：
    - 若 Worker 成功：将对应的子任务标记为 `[x]`。
-   - 若 Worker 失败/报错：**不要盲目重试**。将失败任务标记为 `[!]`（阻塞）或 `[~]`（废弃）。然后在该节点下方动态插入新的诊断任务或替代方案（作为新的 `[ ]` 树枝）。
+   - 若 Worker 失败/报错：**不要盲目重试**。将失败任务标记为 `[!]`（阻塞）或 `[~]`（废弃），并为 `[~]` 强制附加机读注记：`reason=ABANDONED_DIRECT|ABANDONED_AFTER_BLOCKED`。
+     - 直接废弃：`[~] reason=ABANDONED_DIRECT`（未经历阻塞收敛，直接判定当前方案不再推进）。
+     - 阻塞后废弃：`[~] reason=ABANDONED_AFTER_BLOCKED`（该节点或同根因上游节点已有 `[!]` 阻塞证据，随后决定放弃）。
+     - 历史迁移规则：旧写法仅 `[~]` 且无阻塞证据时，迁移为 `reason=ABANDONED_DIRECT`；旧写法仅 `[~]` 且存在同根因阻塞证据时，迁移为 `reason=ABANDONED_AFTER_BLOCKED`。
+   - 然后在该节点下方动态插入新的诊断任务或替代方案（作为新的 `[ ]` 树枝）。
    - 若完成了一个重大 Phase，回顾 `proposal.md` 以确保方向未偏离。
 3. **流程有效性度量（必填）**：在 `PROJECT_STATUS.md` 更新并解释四项指标：`口径驳回率`、`无代码增量驳回率`、`返工轮次`、`平均复验次数`。
 4. **问题分流规则（必填）**：若指标异常或连续劣化，必须同步沉淀到 `LESSONS.md`（长期约束）与 `PLAN.md`（下一步可执行任务），不得只在单一文件留痕。
@@ -86,7 +90,7 @@
 补充约束：
 - 默认派单结构必须是“任务目标 / 约束边界 / 验收标准”。
 - 派单以结果导向为主：默认只给“任务目标 / 约束边界 / 验收标准”，禁止预置逐步实现脚本与改动顺序。
-- 运行时角色链固定为 `Supervisor -> Human Gate -> Worker -> Validator`；`Librarian` 仅用于规则治理，禁止出现在 `next_step` 或 `--from-role`。
+- 运行时角色链固定为 `Supervisor -> Human Gate -> Worker -> Validator`；`Analyst/Q&A` 仅用于非运行时问答分析，禁止出现在 `next_step` 或 `--from-role`。
 - 仅在高风险场景补充必要前置检查（如环境探测、契约冲突检查），不得把逐行实现脚本写入 TASK。
 - 为 Worker/Validator 统一改动归因，默认要求在任务正文中显式提供 `git status --short -- ...`，并写明“开始编码前执行并记录”。
 - 派单前必须完成封板闸门：`git status --short` + 目标文件 `git diff` 证据齐全，且当存在未封板业务脏改时仅允许 `SEAL_ONLY` 放行路径。
