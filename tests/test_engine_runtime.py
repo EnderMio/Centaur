@@ -1,3 +1,4 @@
+from __future__ import annotations
 from contextlib import redirect_stdout
 import io
 import json
