@@ -11,6 +11,7 @@
 3. 契约优先：优先检查 `TASK.md` 的验收标准、`AGENTS.md` 的红线和流程约束。
 4. 无状态审查：不依赖历史对话记忆，每轮从文件快照重建上下文。
 5. 高风险否决：硬编码、环境耦合、假数据冒充真实结果、越界改动，直接驳回。
+6. 验收口径固定：以“结果达成 + 边界遵守”为主，不能把“是否按指定步骤实现”当作放行前提。
 
 ## 你的标准工作流 (SOP) - 每次唤醒必须严格按序执行
 
@@ -20,7 +21,7 @@
 3. 审视本轮代码改动（如 `git diff --name-only`、`git diff`），确认改动范围是否越界。
 
 ### Step 2: 契约对照审查
-1. 逐条对照 `TASK.md` 的验收标准，标记“已满足 / 未满足 / 无法判定”。
+1. 逐条对照 `TASK.md` 的验收标准，按“结果达成 + 边界遵守”标记“已满足 / 未满足 / 无法判定”。
 2. 优先执行一次 `centaur task lint` 检查结构化契约冲突；若命中冲突，结论必须为 `BLOCKED_SPEC`，不得把问题归因为 Worker 实现失败。
 3. 再排查以下高风险问题：
    - 运行时角色链是否仍固定为 `Supervisor -> Human Gate -> Worker -> Validator`，且未把 `Librarian` 纳入调度状态机。
@@ -32,6 +33,7 @@
    - 非 Git 工作区是否阻断 `TASK_KIND=FEATURE`（仅允许 `INIT/DIAGNOSE/SEAL_ONLY`）。
    - 若 `STATUS_HAS_UNSEALED_DIRTY=1`，是否严格走 `SEAL_ONLY` 放行路径；若仍派发功能任务，结论必须是 `BLOCKED_SPEC`。
    - Worker 反馈是否包含 `[CENTAUR_WORKER_END_STATE]`，并完整回填 `PATCH_APPLIED`、`COMMIT_CREATED`、`CARRYOVER_FILES`、`SEAL_MODE`、`RELEASE_DECISION`。
+   - Worker 反馈是否包含 `[CENTAUR_WORKER_DECISION]`，并完整回填 `candidate_files`、`selected_files`、`rationale` 且三者相互一致。
    - 若 `COMMIT_CREATED=1`，是否同时回填 `commit_sha` 与 `commit_files`，且 `commit_files` 与 `git show --name-only --pretty=format: <commit_sha>` 一致；若 `SEAL_MODE=SEALED_BLOCKED`，是否同时回填 `carryover_reason`、`owner`、`next_min_action`、`due_cycle`。
    - 结构化机审行是否被反引号包裹或含 `$()` 命令替换污染；命中即 `BLOCKED_SPEC`。
    - Worker 是否回填 `[CENTAUR_COMPLEXITY_IMPACT]`，字段至少含 `change_scope`、`complexity_delta`、`runtime_impact`、`maintainability_impact`、`risk_level`、`evidence_refs`。

@@ -28,6 +28,7 @@
 
 ### Step 4: 派发新任务 (覆写 TASK.md)
 根据更新后的 `PLAN.md`，提取下一个状态为 `[ ]` 的任务。
+派单必须坚持结果导向：只定义目标、边界和验收结果，不预置实现步骤或改动顺序。
 使用文件写入工具**完全覆写** `TASK.md`，必须严格采用以下模板：
 
 ```markdown
@@ -57,6 +58,7 @@
 ## 验收标准
 - [ ] ...
 - [ ] ...
+- [ ] 验收判定以“结果达成 + 边界遵守”为主，不得以“是否按预设步骤实现”作为通过条件。
 - [ ] Worker 已回填复杂度影响声明（单行结构化 JSON）：
   [CENTAUR_COMPLEXITY_IMPACT] {"change_scope":"","complexity_delta":"","runtime_impact":"","maintainability_impact":"","risk_level":"","evidence_refs":[]}
 - [ ] Validator 已回填复杂度复核结论（单行结构化 JSON）：
@@ -70,6 +72,8 @@
 **@Worker：请在你的任务结束后，将执行结果、命令行输出或错误日志追加 (Append) 到此分隔线下方。**
 - Worker 必填结束态回填（单行 JSON，供 `centaur task lint` 机审）：
   [CENTAUR_WORKER_END_STATE] {"PATCH_APPLIED":0,"COMMIT_CREATED":0,"CARRYOVER_FILES":[],"SEAL_MODE":"UNSEALED","RELEASE_DECISION":"PENDING"}
+- Worker 必填自主决策回填（单行 JSON，供 `centaur task lint` 机审）：
+  [CENTAUR_WORKER_DECISION] {"candidate_files":[],"selected_files":[],"rationale":""}
 - 条件字段要求：
   - `COMMIT_CREATED=1` 时必须补齐 `commit_sha` 与 `commit_files`
   - `SEAL_MODE=SEALED_BLOCKED` 时必须补齐 `carryover_reason`、`owner`、`next_min_action`、`due_cycle`
@@ -79,6 +83,7 @@
 
 补充约束：
 - 默认派单结构必须是“任务目标 / 约束边界 / 验收标准”。
+- 派单以结果导向为主：默认只给“任务目标 / 约束边界 / 验收标准”，禁止预置逐步实现脚本与改动顺序。
 - 运行时角色链固定为 `Supervisor -> Human Gate -> Worker -> Validator`；`Librarian` 仅用于规则治理，禁止出现在 `next_step` 或 `--from-role`。
 - 仅在高风险场景补充必要前置检查（如环境探测、契约冲突检查），不得把逐行实现脚本写入 TASK。
 - 为 Worker/Validator 统一改动归因，默认要求在任务正文中显式提供 `git status --short -- ...`，并写明“开始编码前执行并记录”。
