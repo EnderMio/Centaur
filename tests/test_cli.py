@@ -226,6 +226,11 @@ class InitTemplateRegressionTests(unittest.TestCase):
             "风险分级",
             "阻塞项",
             "下一里程碑",
+            "口径驳回率",
+            "无代码增量驳回率",
+            "返工轮次",
+            "平均复验次数",
+            "问题分流规则",
             "复杂度影响域",
             "复杂度变化依据",
             "测试/基准证据",
@@ -287,6 +292,13 @@ class InitTemplateRegressionTests(unittest.TestCase):
             self.assertIn("SEAL_MODE", supervisor_template)
             self.assertIn("RELEASE_DECISION", supervisor_template)
             self.assertIn("若 `PATCH_APPLIED=1` 且 `COMMIT_CREATED=0`", supervisor_template)
+            self.assertIn("流程有效性度量（必填）", supervisor_template)
+            self.assertIn("口径驳回率", supervisor_template)
+            self.assertIn("无代码增量驳回率", supervisor_template)
+            self.assertIn("返工轮次", supervisor_template)
+            self.assertIn("平均复验次数", supervisor_template)
+            self.assertIn("问题分流规则（必填）", supervisor_template)
+            self.assertIn("同步沉淀到 `LESSONS.md`（长期约束）与 `PLAN.md`（下一步可执行任务）", supervisor_template)
 
     def test_init_freeze_prompts_writes_rule_maintenance_mechanism_and_role_guidance(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -309,6 +321,12 @@ class InitTemplateRegressionTests(unittest.TestCase):
             self.assertIn("`TASK.md`（当轮强约束）", agents_template)
             self.assertIn("`PROJECT_STATUS.md` / `LESSONS.md`（审计沉淀）", agents_template)
             self.assertIn("验收结论必须以结果达成与边界遵守为主", agents_template)
+            self.assertIn("## 8. 流程有效性指标与问题分流 (Flow Effectiveness & Triage)", agents_template)
+            self.assertIn("口径驳回率", agents_template)
+            self.assertIn("无代码增量驳回率", agents_template)
+            self.assertIn("返工轮次", agents_template)
+            self.assertIn("平均复验次数", agents_template)
+            self.assertIn("同步沉淀到 `LESSONS.md`（长期约束）与 `PLAN.md`（下一步可执行任务）", agents_template)
             self.assertNotIn("共享内存权限错误需提权重跑", agents_template)
 
             supervisor_template = (workspace / "SUPERVISOR.md").read_text(encoding="utf-8")

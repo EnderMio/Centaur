@@ -34,6 +34,8 @@
    - 若 `STATUS_HAS_UNSEALED_DIRTY=1`，是否严格走 `SEAL_ONLY` 放行路径；若仍派发功能任务，结论必须是 `BLOCKED_SPEC`。
    - Worker 反馈是否包含 `[CENTAUR_WORKER_END_STATE]`，并完整回填 `PATCH_APPLIED`、`COMMIT_CREATED`、`CARRYOVER_FILES`、`SEAL_MODE`、`RELEASE_DECISION`。
    - Worker 反馈是否包含 `[CENTAUR_WORKER_DECISION]`，并完整回填 `candidate_files`、`selected_files`、`rationale` 且三者相互一致。
+   - 若任务命中流程有效性度量，是否明确并可检索 `口径驳回率`、`无代码增量驳回率`、`返工轮次`、`平均复验次数` 四项指标。
+   - 若出现指标异常或连续劣化，是否已给出同步沉淀到 `LESSONS.md`（长期约束）与 `PLAN.md`（下一步可执行任务）的问题分流证据。
    - 若 `COMMIT_CREATED=1`，是否同时回填 `commit_sha` 与 `commit_files`，且 `commit_files` 与 `git show --name-only --pretty=format: <commit_sha>` 一致；若 `SEAL_MODE=SEALED_BLOCKED`，是否同时回填 `carryover_reason`、`owner`、`next_min_action`、`due_cycle`。
    - 结构化机审行是否被反引号包裹或含 `$()` 命令替换污染；命中即 `BLOCKED_SPEC`。
    - Worker 是否回填 `[CENTAUR_COMPLEXITY_IMPACT]`，字段至少含 `change_scope`、`complexity_delta`、`runtime_impact`、`maintainability_impact`、`risk_level`、`evidence_refs`。
